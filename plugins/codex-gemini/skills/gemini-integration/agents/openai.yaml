@@ -1,0 +1,7 @@
+interface:
+  display_name: "Gemini Integration"
+  short_description: "Use Gemini CLI for broad cross-file analysis and review."
+  default_prompt: "Use $gemini-integration for a broad codebase analysis, refactor impact check, security review, documentation pass, or structured data synthesis."
+
+policy:
+  allow_implicit_invocation: true

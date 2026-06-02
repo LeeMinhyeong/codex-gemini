@@ -1,0 +1,20 @@
+{
+  "name": "gemini-tools",
+  "interface": {
+    "displayName": "Gemini Tools"
+  },
+  "plugins": [
+    {
+      "name": "codex-gemini",
+      "source": {
+        "source": "local",
+        "path": "./plugins/codex-gemini"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Engineering"
+    }
+  ]
+}

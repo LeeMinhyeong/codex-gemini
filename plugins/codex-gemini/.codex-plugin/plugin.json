@@ -1,0 +1,32 @@
+{
+  "name": "codex-gemini",
+  "version": "0.1.0",
+  "description": "Use Gemini CLI from Codex for broad codebase analysis, review, and synthesis tasks.",
+  "author": {
+    "name": "LeeMinhyeong"
+  },
+  "homepage": "https://github.com/LeeMinhyeong/codex-gemini",
+  "repository": "https://github.com/LeeMinhyeong/codex-gemini",
+  "license": "MIT",
+  "keywords": [
+    "gemini",
+    "gemini-cli",
+    "code-review",
+    "architecture",
+    "analysis",
+    "codex"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Gemini",
+    "shortDescription": "Delegate broad codebase analysis to Gemini CLI",
+    "longDescription": "Gemini lets Codex hand large cross-file analysis tasks to the local Gemini CLI. Use it for architecture reviews, refactor impact analysis, security sweeps, documentation synthesis, and structured data review when one large-context pass is useful.",
+    "developerName": "LeeMinhyeong",
+    "category": "Engineering",
+    "capabilities": [
+      "Read",
+      "Analyze"
+    ],
+    "defaultPrompt": "Use $gemini-integration for a broad codebase analysis or review pass."
+  }
+}
