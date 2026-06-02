@@ -6,6 +6,7 @@ const path = require("node:path");
 
 const DEFAULT_MAX_FILES = 40;
 const DEFAULT_MAX_FILE_BYTES = 32768;
+const STDIN_PROMPT_INSTRUCTION = "Use the prompt provided on stdin and answer it.";
 const SUPPORTED_FORMATS = new Set(["text", "json", "stream-json"]);
 
 const KNOWN_BINARY_EXTENSIONS = new Set([
@@ -509,8 +510,8 @@ function buildGeminiPrompt({ task, context, cwd }) {
   ].join("\n");
 }
 
-function buildGeminiArgs({ prompt, model, format }) {
-  const args = ["-p", prompt];
+function buildGeminiArgs({ model, format }) {
+  const args = ["-p", STDIN_PROMPT_INSTRUCTION];
   if (model) {
     args.push("-m", model);
   }
@@ -552,9 +553,10 @@ function resolveGeminiInvocation() {
   return { command: "gemini", prefixArgs: [] };
 }
 
-function printResolvedCommand(command, args) {
+function printResolvedCommand(command, args, stdinText) {
   const rendered = [command, ...args.map((arg) => JSON.stringify(arg))].join(" ");
   process.stdout.write(`${rendered}\n`);
+  process.stdout.write(`[stdin: ${Buffer.byteLength(stdinText, "utf8")} bytes]\n`);
 }
 
 function run(argv) {
@@ -574,7 +576,6 @@ function run(argv) {
   });
   const prompt = buildGeminiPrompt({ task: parsed.task, context, cwd });
   const geminiArgs = buildGeminiArgs({
-    prompt,
     model: parsed.model,
     format: parsed.format,
   });
@@ -582,12 +583,13 @@ function run(argv) {
   const commandArgs = [...geminiInvocation.prefixArgs, ...geminiArgs];
 
   if (parsed.printCommand) {
-    printResolvedCommand(geminiInvocation.command, commandArgs);
+    printResolvedCommand(geminiInvocation.command, commandArgs, prompt);
     return 0;
   }
 
   const result = spawnSync(geminiInvocation.command, commandArgs, {
     encoding: "utf8",
+    input: prompt,
     maxBuffer: 20 * 1024 * 1024,
   });
 

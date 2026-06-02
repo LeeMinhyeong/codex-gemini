@@ -21,6 +21,8 @@ gemini auth
 
 On Windows, this plugin invokes the Gemini CLI JavaScript entrypoint directly through Node.js when possible. That avoids PowerShell `.ps1` execution-policy issues and npm `.cmd` shim spawning problems.
 
+Large prompts are sent to Gemini CLI through stdin instead of command-line arguments, which avoids Windows command-line length limits when inlining multiple files.
+
 ## Install
 
 Add this repository as a Codex marketplace source:
