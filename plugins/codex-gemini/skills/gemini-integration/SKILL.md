@@ -49,6 +49,11 @@ The bridge:
 - `--format <text|json|stream-json>`: choose Gemini output format
 - `--max-files <n>`: limit files inlined into the prompt
 - `--max-file-bytes <n>`: limit bytes per file
+- `--timeout-ms <n>`: kill Gemini if it runs longer than this many milliseconds; `0` disables the bridge timeout
+- `--warn-prompt-bytes <n>`: warn when the generated prompt reaches this byte size; `0` disables the warning
+- `--fail-on-prompt-bytes <n>`: fail before calling Gemini when the generated prompt exceeds this byte size
+- `--print-prompt-size`: print the generated prompt byte size before calling Gemini
+- `--output-file <path>`: write Gemini stdout to a workspace-local file
 - `--print-command`: inspect the resolved Gemini command without running it
 
 ## Patterns
@@ -68,7 +73,7 @@ node <plugin-root>\scripts\gemini-bridge.js --dirs src "Analyze the impact of re
 Security review:
 
 ```powershell
-node <plugin-root>\scripts\gemini-bridge.js --files "src/**/*.ts,src/**/*.tsx" "Review auth and input handling. Output file:line, risk, and recommended fix."
+node <plugin-root>\scripts\gemini-bridge.js --files "src/**/*.ts,src/**/*.tsx" --timeout-ms 300000 --output-file _workspace/gemini-security-review.md "Review auth and input handling. Output file:line, risk, and recommended fix."
 ```
 
 Structured data:
@@ -80,6 +85,8 @@ node <plugin-root>\scripts\gemini-bridge.js --files "schemas/**/*.json,data/**/*
 ## Practical Rules
 
 - Narrow the context deliberately with `--dirs` or `--files`.
+- For broad code review, set `--timeout-ms` and split the task if the prompt-size warning appears.
+- If a timeout happens, reduce `--max-files` or `--max-file-bytes`, split by module, or raise `--timeout-ms`.
 - Do not send secrets, private credentials, or unrelated user data to Gemini.
 - Ask for a concrete output format when using Gemini for review.
 - Treat Gemini output as another reviewer, not an authority.

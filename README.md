@@ -55,6 +55,12 @@ Review selected files:
 node plugins/codex-gemini/scripts/gemini-bridge.js --files "src/**/*.ts,src/**/*.tsx" "Review auth and input handling. Return file, risk, and fix."
 ```
 
+Run a larger review with an explicit timeout and saved output:
+
+```powershell
+node plugins/codex-gemini/scripts/gemini-bridge.js --dirs src --timeout-ms 300000 --output-file _workspace/gemini-review.md "Review the implementation and cite files."
+```
+
 Inspect the resolved Gemini command without running it:
 
 ```powershell
@@ -69,6 +75,11 @@ node plugins/codex-gemini/scripts/gemini-bridge.js --print-command "Summarize th
 - `--format <text|json|stream-json>`: choose Gemini output format
 - `--max-files <n>`: limit files inlined into the prompt
 - `--max-file-bytes <n>`: limit bytes per file
+- `--timeout-ms <n>`: kill Gemini if it runs longer than this many milliseconds; `0` disables the bridge timeout
+- `--warn-prompt-bytes <n>`: warn when the generated prompt reaches this byte size; `0` disables the warning
+- `--fail-on-prompt-bytes <n>`: fail before calling Gemini when the generated prompt exceeds this byte size
+- `--print-prompt-size`: print the generated prompt byte size before calling Gemini
+- `--output-file <path>`: write Gemini stdout to a workspace-local file
 - `--print-command`: show the resolved command without running Gemini
 
 ## Privacy and Data
@@ -103,6 +114,14 @@ If Gemini reports an authentication issue:
 ```powershell
 gemini auth
 ```
+
+If a large review times out, rerun it with a smaller scope or a longer explicit timeout:
+
+```powershell
+node plugins/codex-gemini/scripts/gemini-bridge.js --dirs backend/src --max-files 12 --max-file-bytes 8000 --timeout-ms 300000 "Review this area."
+```
+
+The bridge reports the prompt size on timeout. Use that to split the task into smaller review passes when needed.
 
 If Codex does not show the plugin after installation, restart Codex and start a new thread.
 

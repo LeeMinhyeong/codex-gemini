@@ -1,11 +1,15 @@
 #!/usr/bin/env node
 
-const { spawnSync } = require("node:child_process");
+const { spawn } = require("node:child_process");
 const fs = require("node:fs");
 const path = require("node:path");
 
 const DEFAULT_MAX_FILES = 40;
 const DEFAULT_MAX_FILE_BYTES = 32768;
+const DEFAULT_WARN_PROMPT_BYTES = 32768;
+const DEFAULT_TIMEOUT_MS = 0;
+const MAX_CAPTURE_BYTES = 20 * 1024 * 1024;
+const SNIPPET_CHARS = 2000;
 const STDIN_PROMPT_INSTRUCTION = "Use the prompt provided on stdin and answer it.";
 const SUPPORTED_FORMATS = new Set(["text", "json", "stream-json"]);
 
@@ -130,6 +134,12 @@ Options:
   --format <format>        text, json, or stream-json. Default: text.
   --max-files <n>          Maximum files to inline. Default: ${DEFAULT_MAX_FILES}.
   --max-file-bytes <n>     Maximum bytes per file. Default: ${DEFAULT_MAX_FILE_BYTES}.
+  --timeout-ms <n>         Kill Gemini if it runs longer than n ms. 0 disables. Default: ${DEFAULT_TIMEOUT_MS}.
+  --warn-prompt-bytes <n>  Warn when the prompt reaches n bytes. 0 disables. Default: ${DEFAULT_WARN_PROMPT_BYTES}.
+  --fail-on-prompt-bytes <n>
+                           Fail before calling Gemini when the prompt exceeds n bytes.
+  --print-prompt-size      Print the prompt byte size before calling Gemini.
+  --output-file <path>     Write Gemini stdout to a workspace-local file.
   --print-command          Print the resolved Gemini command and exit.
   -h, --help               Show this help.
 
@@ -198,6 +208,14 @@ function parsePositiveInteger(rawValue, flagName) {
   return value;
 }
 
+function parseNonNegativeInteger(rawValue, flagName) {
+  const value = Number.parseInt(rawValue, 10);
+  if (!Number.isInteger(value) || value < 0) {
+    throw new Error(`${flagName} must be a non-negative integer. Received: ${rawValue}`);
+  }
+  return value;
+}
+
 function takeOptionValue(argv, index, flagName) {
   const value = argv[index + 1];
   if (!value || value.startsWith("--")) {
@@ -214,6 +232,11 @@ function parseCliArgs(argv) {
     format: "text",
     maxFiles: DEFAULT_MAX_FILES,
     maxFileBytes: DEFAULT_MAX_FILE_BYTES,
+    timeoutMs: DEFAULT_TIMEOUT_MS,
+    warnPromptBytes: DEFAULT_WARN_PROMPT_BYTES,
+    failOnPromptBytes: undefined,
+    printPromptSize: false,
+    outputFile: undefined,
     printCommand: false,
     task: "",
     help: false,
@@ -263,6 +286,25 @@ function parseCliArgs(argv) {
         break;
       case "--max-file-bytes":
         parsed.maxFileBytes = parsePositiveInteger(takeOptionValue(argv, index, token), token);
+        index += 1;
+        break;
+      case "--timeout-ms":
+        parsed.timeoutMs = parseNonNegativeInteger(takeOptionValue(argv, index, token), token);
+        index += 1;
+        break;
+      case "--warn-prompt-bytes":
+        parsed.warnPromptBytes = parseNonNegativeInteger(takeOptionValue(argv, index, token), token);
+        index += 1;
+        break;
+      case "--fail-on-prompt-bytes":
+        parsed.failOnPromptBytes = parseNonNegativeInteger(takeOptionValue(argv, index, token), token);
+        index += 1;
+        break;
+      case "--print-prompt-size":
+        parsed.printPromptSize = true;
+        break;
+      case "--output-file":
+        parsed.outputFile = takeOptionValue(argv, index, token);
         index += 1;
         break;
       case "--print-command":
@@ -559,7 +601,194 @@ function printResolvedCommand(command, args, stdinText) {
   process.stdout.write(`[stdin: ${Buffer.byteLength(stdinText, "utf8")} bytes]\n`);
 }
 
-function run(argv) {
+function formatBytes(bytes) {
+  if (bytes < 1024) {
+    return `${bytes} B`;
+  }
+  if (bytes < 1024 * 1024) {
+    return `${(bytes / 1024).toFixed(1)} KiB`;
+  }
+  return `${(bytes / 1024 / 1024).toFixed(1)} MiB`;
+}
+
+function promptSizeAdvice() {
+  return [
+    "Try narrowing --dirs/--files, lowering --max-files or --max-file-bytes,",
+    "splitting the review into smaller passes, or increasing --timeout-ms.",
+  ].join(" ");
+}
+
+function outputSnippet(label, text) {
+  const trimmed = text.trim();
+  if (!trimmed) {
+    return "";
+  }
+  const snippet =
+    trimmed.length > SNIPPET_CHARS ? trimmed.slice(trimmed.length - SNIPPET_CHARS) : trimmed;
+  return `\n${label} tail:\n${snippet}\n`;
+}
+
+function resolveOutputFile(cwd, outputFile) {
+  if (!outputFile) {
+    return undefined;
+  }
+  const workspaceRoot = path.resolve(cwd);
+  const absolutePath = path.resolve(cwd, outputFile);
+  if (!isInside(workspaceRoot, absolutePath)) {
+    throw new Error("--output-file must stay inside the current workspace.");
+  }
+  return absolutePath;
+}
+
+function writePromptDiagnostics({ promptBytes, warnPromptBytes, printPromptSize }) {
+  if (printPromptSize) {
+    process.stderr.write(`[gemini-bridge] Prompt size: ${formatBytes(promptBytes)} (${promptBytes} bytes)\n`);
+  }
+  if (warnPromptBytes > 0 && promptBytes >= warnPromptBytes) {
+    process.stderr.write(
+      `[gemini-bridge] Large prompt: ${formatBytes(promptBytes)} (${promptBytes} bytes). ${promptSizeAdvice()}\n`,
+    );
+  }
+}
+
+function killProcessTree(child) {
+  return new Promise((resolve) => {
+    if (!child.pid) {
+      resolve();
+      return;
+    }
+
+    if (process.platform === "win32") {
+      const killer = spawn("taskkill", ["/PID", String(child.pid), "/T", "/F"], {
+        windowsHide: true,
+        stdio: "ignore",
+      });
+      const finish = () => {
+        try {
+          child.kill();
+        } catch {
+          // The process may already be gone.
+        }
+        resolve();
+      };
+      killer.once("error", finish);
+      killer.once("close", finish);
+      return;
+    }
+
+    try {
+      child.kill("SIGTERM");
+    } catch {
+      resolve();
+      return;
+    }
+
+    const forceTimer = setTimeout(() => {
+      try {
+        child.kill("SIGKILL");
+      } catch {
+        // The process may already be gone.
+      }
+      resolve();
+    }, 1500);
+
+    child.once("exit", () => {
+      clearTimeout(forceTimer);
+      resolve();
+    });
+  });
+}
+
+function runGemini(command, args, { input, timeoutMs }) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, {
+      stdio: ["pipe", "pipe", "pipe"],
+      windowsHide: true,
+    });
+
+    const stdoutChunks = [];
+    const stderrChunks = [];
+    let stdoutBytes = 0;
+    let stderrBytes = 0;
+    let timedOut = false;
+    let outputExceeded = false;
+    let settled = false;
+
+    const clearTimer = timeoutMs > 0 ? setTimeout(async () => {
+      timedOut = true;
+      await killProcessTree(child);
+    }, timeoutMs) : undefined;
+
+    function capture(chunks, currentBytes, chunk) {
+      chunks.push(chunk);
+      return currentBytes + chunk.length;
+    }
+
+    function checkCaptureLimit() {
+      if (!outputExceeded && stdoutBytes + stderrBytes > MAX_CAPTURE_BYTES) {
+        outputExceeded = true;
+        killProcessTree(child).catch(() => {});
+      }
+    }
+
+    child.stdout.on("data", (chunk) => {
+      stdoutBytes = capture(stdoutChunks, stdoutBytes, chunk);
+      checkCaptureLimit();
+    });
+    child.stderr.on("data", (chunk) => {
+      stderrBytes = capture(stderrChunks, stderrBytes, chunk);
+      checkCaptureLimit();
+    });
+    child.once("error", (error) => {
+      if (clearTimer) {
+        clearTimeout(clearTimer);
+      }
+      if (!settled) {
+        settled = true;
+        reject(error);
+      }
+    });
+    child.once("close", (status, signal) => {
+      if (clearTimer) {
+        clearTimeout(clearTimer);
+      }
+      if (settled) {
+        return;
+      }
+      settled = true;
+      resolve({
+        status: status === null ? 1 : status,
+        signal,
+        stdout: Buffer.concat(stdoutChunks).toString("utf8"),
+        stderr: Buffer.concat(stderrChunks).toString("utf8"),
+        timedOut,
+        outputExceeded,
+      });
+    });
+
+    child.stdin.on("error", () => {
+      // Gemini may close stdin early on fast failures; the process result carries the error details.
+    });
+    child.stdin.end(input);
+  });
+}
+
+function writeOutput(cwd, outputFilePath, stdout) {
+  if (!outputFilePath) {
+    if (stdout) {
+      process.stdout.write(stdout);
+    }
+    return;
+  }
+
+  fs.mkdirSync(path.dirname(outputFilePath), { recursive: true });
+  fs.writeFileSync(outputFilePath, stdout || "", "utf8");
+  process.stderr.write(
+    `[gemini-bridge] Wrote Gemini stdout to ${relativeToCwd(cwd, outputFilePath)}\n`,
+  );
+}
+
+async function run(argv) {
   const parsed = parseCliArgs(argv);
   if (parsed.help) {
     process.stdout.write(USAGE);
@@ -581,41 +810,76 @@ function run(argv) {
   });
   const geminiInvocation = resolveGeminiInvocation();
   const commandArgs = [...geminiInvocation.prefixArgs, ...geminiArgs];
+  const promptBytes = Buffer.byteLength(prompt, "utf8");
 
   if (parsed.printCommand) {
     printResolvedCommand(geminiInvocation.command, commandArgs, prompt);
     return 0;
   }
 
-  const result = spawnSync(geminiInvocation.command, commandArgs, {
-    encoding: "utf8",
-    input: prompt,
-    maxBuffer: 20 * 1024 * 1024,
+  const outputFilePath = resolveOutputFile(cwd, parsed.outputFile);
+
+  if (parsed.failOnPromptBytes > 0 && promptBytes > parsed.failOnPromptBytes) {
+    throw new Error(
+      `Prompt size ${formatBytes(promptBytes)} (${promptBytes} bytes) exceeds --fail-on-prompt-bytes ${parsed.failOnPromptBytes}. ${promptSizeAdvice()}`,
+    );
+  }
+
+  writePromptDiagnostics({
+    promptBytes,
+    warnPromptBytes: parsed.warnPromptBytes,
+    printPromptSize: parsed.printPromptSize,
   });
 
-  if (result.error) {
-    if (result.error.code === "ENOENT") {
-      throw new Error(
-        "Gemini CLI is not installed or not on PATH. Install it with `npm install -g @google/gemini-cli`, then run `gemini auth`.",
-      );
-    }
-    throw result.error;
+  const result = await runGemini(geminiInvocation.command, commandArgs, {
+    input: prompt,
+    timeoutMs: parsed.timeoutMs,
+  });
+
+  if (result.timedOut) {
+    process.stderr.write(
+      [
+        `[gemini-bridge] Gemini timed out after ${parsed.timeoutMs} ms.`,
+        `Prompt size: ${formatBytes(promptBytes)} (${promptBytes} bytes).`,
+        promptSizeAdvice(),
+        outputSnippet("stdout", result.stdout),
+        outputSnippet("stderr", result.stderr),
+      ].join("\n") + "\n",
+    );
+    return 124;
   }
 
-  if (result.stdout) {
-    process.stdout.write(result.stdout);
+  if (result.outputExceeded) {
+    process.stderr.write(
+      `[gemini-bridge] Gemini output exceeded ${formatBytes(MAX_CAPTURE_BYTES)}. Narrow the request or ask for a shorter response.\n`,
+    );
+    return 1;
   }
+
+  writeOutput(cwd, outputFilePath, result.stdout);
   if (result.stderr) {
     process.stderr.write(result.stderr);
+  }
+  if (result.status !== 0) {
+    process.stderr.write(
+      `[gemini-bridge] Gemini exited with status ${result.status}. Prompt size: ${formatBytes(promptBytes)} (${promptBytes} bytes).\n`,
+    );
   }
   return result.status === null ? 1 : result.status;
 }
 
 if (require.main === module) {
-  try {
-    process.exitCode = run(process.argv.slice(2));
-  } catch (error) {
+  run(process.argv.slice(2)).then((exitCode) => {
+    process.exitCode = exitCode;
+  }).catch((error) => {
+    if (error.code === "ENOENT") {
+      process.stderr.write(
+        "Gemini CLI is not installed or not on PATH. Install it with `npm install -g @google/gemini-cli`, then run `gemini auth`.\n",
+      );
+      process.exitCode = 1;
+      return;
+    }
     process.stderr.write(`${error.message}\n`);
     process.exitCode = 1;
-  }
+  });
 }
