@@ -8,10 +8,13 @@ const DEFAULT_MAX_FILES = 40;
 const DEFAULT_MAX_FILE_BYTES = 32768;
 const DEFAULT_WARN_PROMPT_BYTES = 32768;
 const DEFAULT_TIMEOUT_MS = 0;
+const DEFAULT_HEARTBEAT_MS = 30000;
 const MAX_CAPTURE_BYTES = 20 * 1024 * 1024;
 const SNIPPET_CHARS = 2000;
+const WATCHDOG_SCRIPT = path.join(__dirname, "gemini-watchdog.js");
 const STDIN_PROMPT_INSTRUCTION = "Use the prompt provided on stdin and answer it.";
 const SUPPORTED_FORMATS = new Set(["text", "json", "stream-json"]);
+const FORWARDED_SIGNALS = ["SIGINT", "SIGTERM", "SIGHUP"];
 
 const KNOWN_BINARY_EXTENSIONS = new Set([
   ".7z",
@@ -135,6 +138,7 @@ Options:
   --max-files <n>          Maximum files to inline. Default: ${DEFAULT_MAX_FILES}.
   --max-file-bytes <n>     Maximum bytes per file. Default: ${DEFAULT_MAX_FILE_BYTES}.
   --timeout-ms <n>         Kill Gemini if it runs longer than n ms. 0 disables. Default: ${DEFAULT_TIMEOUT_MS}.
+  --heartbeat-ms <n>       Report progress every n ms. 0 disables. Default: ${DEFAULT_HEARTBEAT_MS}.
   --warn-prompt-bytes <n>  Warn when the prompt reaches n bytes. 0 disables. Default: ${DEFAULT_WARN_PROMPT_BYTES}.
   --fail-on-prompt-bytes <n>
                            Fail before calling Gemini when the prompt exceeds n bytes.
@@ -233,6 +237,7 @@ function parseCliArgs(argv) {
     maxFiles: DEFAULT_MAX_FILES,
     maxFileBytes: DEFAULT_MAX_FILE_BYTES,
     timeoutMs: DEFAULT_TIMEOUT_MS,
+    heartbeatMs: DEFAULT_HEARTBEAT_MS,
     warnPromptBytes: DEFAULT_WARN_PROMPT_BYTES,
     failOnPromptBytes: undefined,
     printPromptSize: false,
@@ -290,6 +295,10 @@ function parseCliArgs(argv) {
         break;
       case "--timeout-ms":
         parsed.timeoutMs = parseNonNegativeInteger(takeOptionValue(argv, index, token), token);
+        index += 1;
+        break;
+      case "--heartbeat-ms":
+        parsed.heartbeatMs = parseNonNegativeInteger(takeOptionValue(argv, index, token), token);
         index += 1;
         break;
       case "--warn-prompt-bytes":
@@ -651,6 +660,78 @@ function writePromptDiagnostics({ promptBytes, warnPromptBytes, printPromptSize 
   }
 }
 
+function signalExitCode(signal) {
+  return {
+    SIGHUP: 129,
+    SIGINT: 130,
+    SIGTERM: 143,
+  }[signal] || 1;
+}
+
+function startWindowsWatchdog(child) {
+  if (
+    process.platform !== "win32" ||
+    !child.pid ||
+    !fs.existsSync(WATCHDOG_SCRIPT)
+  ) {
+    return undefined;
+  }
+
+  let settleReady;
+  const ready = new Promise((resolve) => {
+    settleReady = resolve;
+  });
+  let readySettled = false;
+  const finishReady = (value) => {
+    if (!readySettled) {
+      readySettled = true;
+      settleReady(value);
+    }
+  };
+  const watchdog = spawn(
+    process.execPath,
+    [WATCHDOG_SCRIPT, String(process.pid), String(child.pid)],
+    {
+      detached: true,
+      windowsHide: true,
+      stdio: ["ignore", "ignore", "ignore", "ipc"],
+    },
+  );
+
+  watchdog.once("error", (error) => {
+    finishReady(false);
+    process.stderr.write(`[gemini-bridge] Watchdog unavailable: ${error.message}\n`);
+  });
+  watchdog.once("exit", () => finishReady(false));
+  watchdog.on("message", (message) => {
+    if (message?.type === "ready") {
+      finishReady(true);
+    }
+  });
+  setTimeout(() => finishReady(false), 2000).unref();
+  watchdog.unref();
+  return { process: watchdog, ready };
+}
+
+function stopWatchdog(watchdogState) {
+  const watchdog = watchdogState?.process;
+  if (!watchdog || !watchdog.connected) {
+    return;
+  }
+
+  try {
+    watchdog.send({ type: "stop" }, () => {
+      try {
+        watchdog.disconnect();
+      } catch {
+        // The watchdog may already have exited after observing the Gemini process.
+      }
+    });
+  } catch {
+    // The watchdog may already have exited after observing the Gemini process.
+  }
+}
+
 function killProcessTree(child) {
   return new Promise((resolve) => {
     if (!child.pid) {
@@ -699,25 +780,81 @@ function killProcessTree(child) {
   });
 }
 
-function runGemini(command, args, { input, timeoutMs }) {
+function runGemini(command, args, { input, timeoutMs, heartbeatMs, promptBytes, env = process.env }) {
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, {
+      env,
       stdio: ["pipe", "pipe", "pipe"],
       windowsHide: true,
     });
+    const watchdogState = startWindowsWatchdog(child);
 
     const stdoutChunks = [];
     const stderrChunks = [];
     let stdoutBytes = 0;
     let stderrBytes = 0;
-    let timedOut = false;
-    let outputExceeded = false;
+    let termination;
+    let terminationPromise;
     let settled = false;
+    const startedAt = Date.now();
 
-    const clearTimer = timeoutMs > 0 ? setTimeout(async () => {
-      timedOut = true;
-      await killProcessTree(child);
-    }, timeoutMs) : undefined;
+    let timeoutTimer;
+    let heartbeatTimer;
+    const signalHandlers = new Map();
+
+    function clearLifecycleHandlers() {
+      if (timeoutTimer) {
+        clearTimeout(timeoutTimer);
+      }
+      if (heartbeatTimer) {
+        clearInterval(heartbeatTimer);
+      }
+      for (const [signal, handler] of signalHandlers) {
+        process.removeListener(signal, handler);
+      }
+      stopWatchdog(watchdogState);
+    }
+
+    function requestTermination(nextTermination) {
+      if (termination) {
+        return terminationPromise || Promise.resolve();
+      }
+      termination = nextTermination;
+      if (heartbeatTimer) {
+        clearInterval(heartbeatTimer);
+      }
+      terminationPromise = killProcessTree(child);
+      return terminationPromise;
+    }
+
+    if (timeoutMs > 0) {
+      timeoutTimer = setTimeout(() => {
+        requestTermination({ type: "timeout" }).catch(() => {});
+      }, timeoutMs);
+    }
+
+    if (heartbeatMs > 0) {
+      heartbeatTimer = setInterval(() => {
+        if (termination) {
+          return;
+        }
+        const elapsedSeconds = Math.round((Date.now() - startedAt) / 1000);
+        process.stderr.write(
+          `[gemini-bridge] Gemini still running: elapsed=${elapsedSeconds}s, prompt=${formatBytes(promptBytes)}, pid=${child.pid}.\n`,
+        );
+      }, heartbeatMs);
+    }
+
+    for (const signal of FORWARDED_SIGNALS) {
+      const handler = () => {
+        if (!termination) {
+          process.stderr.write(`[gemini-bridge] Received ${signal}; stopping Gemini.\n`);
+        }
+        requestTermination({ type: "signal", signal }).catch(() => {});
+      };
+      signalHandlers.set(signal, handler);
+      process.once(signal, handler);
+    }
 
     function capture(chunks, currentBytes, chunk) {
       chunks.push(chunk);
@@ -725,9 +862,8 @@ function runGemini(command, args, { input, timeoutMs }) {
     }
 
     function checkCaptureLimit() {
-      if (!outputExceeded && stdoutBytes + stderrBytes > MAX_CAPTURE_BYTES) {
-        outputExceeded = true;
-        killProcessTree(child).catch(() => {});
+      if (!termination && stdoutBytes + stderrBytes > MAX_CAPTURE_BYTES) {
+        requestTermination({ type: "output-limit" }).catch(() => {});
       }
     }
 
@@ -740,18 +876,14 @@ function runGemini(command, args, { input, timeoutMs }) {
       checkCaptureLimit();
     });
     child.once("error", (error) => {
-      if (clearTimer) {
-        clearTimeout(clearTimer);
-      }
+      clearLifecycleHandlers();
       if (!settled) {
         settled = true;
         reject(error);
       }
     });
     child.once("close", (status, signal) => {
-      if (clearTimer) {
-        clearTimeout(clearTimer);
-      }
+      clearLifecycleHandlers();
       if (settled) {
         return;
       }
@@ -761,15 +893,24 @@ function runGemini(command, args, { input, timeoutMs }) {
         signal,
         stdout: Buffer.concat(stdoutChunks).toString("utf8"),
         stderr: Buffer.concat(stderrChunks).toString("utf8"),
-        timedOut,
-        outputExceeded,
+        termination,
       });
     });
 
     child.stdin.on("error", () => {
       // Gemini may close stdin early on fast failures; the process result carries the error details.
     });
-    child.stdin.end(input);
+    const watchdogReady = watchdogState?.ready || Promise.resolve(true);
+    watchdogReady.then((ready) => {
+      if (!ready && process.platform === "win32" && !settled) {
+        process.stderr.write(
+          "[gemini-bridge] Watchdog did not become ready; signal and timeout cleanup remain active.\n",
+        );
+      }
+      if (!settled) {
+        child.stdin.end(input);
+      }
+    });
   });
 }
 
@@ -834,9 +975,18 @@ async function run(argv) {
   const result = await runGemini(geminiInvocation.command, commandArgs, {
     input: prompt,
     timeoutMs: parsed.timeoutMs,
+    heartbeatMs: parsed.heartbeatMs,
+    promptBytes,
   });
 
-  if (result.timedOut) {
+  if (result.termination?.type === "signal") {
+    process.stderr.write(
+      `[gemini-bridge] Gemini process tree stopped after ${result.termination.signal}.\n`,
+    );
+    return signalExitCode(result.termination.signal);
+  }
+
+  if (result.termination?.type === "timeout") {
     process.stderr.write(
       [
         `[gemini-bridge] Gemini timed out after ${parsed.timeoutMs} ms.`,
@@ -849,7 +999,7 @@ async function run(argv) {
     return 124;
   }
 
-  if (result.outputExceeded) {
+  if (result.termination?.type === "output-limit") {
     process.stderr.write(
       `[gemini-bridge] Gemini output exceeded ${formatBytes(MAX_CAPTURE_BYTES)}. Narrow the request or ask for a shorter response.\n`,
     );
@@ -883,3 +1033,7 @@ if (require.main === module) {
     process.exitCode = 1;
   });
 }
+
+module.exports = {
+  runGemini,
+};

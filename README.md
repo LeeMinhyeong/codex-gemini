@@ -23,6 +23,8 @@ On Windows, this plugin invokes the Gemini CLI JavaScript entrypoint directly th
 
 Large prompts are sent to Gemini CLI through stdin instead of command-line arguments, which avoids Windows command-line length limits when inlining multiple files.
 
+The bridge forwards cancellation signals to Gemini and reports a heartbeat during long-running requests. On Windows, a detached watchdog also terminates the Gemini process tree if the bridge is force-killed before it can run normal cleanup.
+
 ## Install
 
 Add this repository as a Codex marketplace source:
@@ -76,6 +78,7 @@ node plugins/codex-gemini/scripts/gemini-bridge.js --print-command "Summarize th
 - `--max-files <n>`: limit files inlined into the prompt
 - `--max-file-bytes <n>`: limit bytes per file
 - `--timeout-ms <n>`: kill Gemini if it runs longer than this many milliseconds; `0` disables the bridge timeout
+- `--heartbeat-ms <n>`: report elapsed time, prompt size, and Gemini PID on stderr; `0` disables the heartbeat
 - `--warn-prompt-bytes <n>`: warn when the generated prompt reaches this byte size; `0` disables the warning
 - `--fail-on-prompt-bytes <n>`: fail before calling Gemini when the generated prompt exceeds this byte size
 - `--print-prompt-size`: print the generated prompt byte size before calling Gemini
@@ -122,6 +125,8 @@ node plugins/codex-gemini/scripts/gemini-bridge.js --dirs backend/src --max-file
 ```
 
 The bridge reports the prompt size on timeout. Use that to split the task into smaller review passes when needed.
+
+Timeouts are optional and disabled by default. Interactive cancellation still stops the Gemini process tree, and long-running requests emit a heartbeat every 30 seconds by default.
 
 If Codex does not show the plugin after installation, restart Codex and start a new thread.
 

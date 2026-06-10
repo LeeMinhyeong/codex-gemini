@@ -39,6 +39,8 @@ The bridge:
 - skips common secret files such as `.env`, SSH keys, certificates, credentials, and service account files
 - inlines text-like files into a structured prompt
 - invokes `gemini` in headless mode
+- forwards cancellation signals and supervises the Gemini process tree
+- reports heartbeat progress for long-running requests
 - asks Gemini to cite file paths and call out partial context
 
 ## Options
@@ -50,6 +52,7 @@ The bridge:
 - `--max-files <n>`: limit files inlined into the prompt
 - `--max-file-bytes <n>`: limit bytes per file
 - `--timeout-ms <n>`: kill Gemini if it runs longer than this many milliseconds; `0` disables the bridge timeout
+- `--heartbeat-ms <n>`: report elapsed time, prompt size, and Gemini PID on stderr; `0` disables the heartbeat
 - `--warn-prompt-bytes <n>`: warn when the generated prompt reaches this byte size; `0` disables the warning
 - `--fail-on-prompt-bytes <n>`: fail before calling Gemini when the generated prompt exceeds this byte size
 - `--print-prompt-size`: print the generated prompt byte size before calling Gemini
@@ -85,7 +88,9 @@ node <plugin-root>\scripts\gemini-bridge.js --files "schemas/**/*.json,data/**/*
 ## Practical Rules
 
 - Narrow the context deliberately with `--dirs` or `--files`.
-- For broad code review, set `--timeout-ms` and split the task if the prompt-size warning appears.
+- Leave `--timeout-ms` at `0` for interactive reviews unless a hard execution bound is useful.
+- Use `--timeout-ms` for CI, unattended jobs, or explicitly bounded review passes.
+- Treat heartbeat messages as progress diagnostics; they are written to stderr and do not alter Gemini output.
 - If a timeout happens, reduce `--max-files` or `--max-file-bytes`, split by module, or raise `--timeout-ms`.
 - Do not send secrets, private credentials, or unrelated user data to Gemini.
 - Ask for a concrete output format when using Gemini for review.
