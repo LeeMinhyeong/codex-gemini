@@ -38,6 +38,7 @@ The bridge:
 - skips binary and generated-heavy paths
 - skips common secret files such as `.env`, SSH keys, certificates, credentials, and service account files
 - inlines text-like files into a structured prompt
+- serializes file contents and Git diffs as untrusted JSON data
 - invokes `gemini` in headless mode
 - forwards cancellation signals and supervises the Gemini process tree
 - reports heartbeat progress for long-running requests
@@ -47,16 +48,24 @@ The bridge:
 
 - `--dirs <path,...>`: recursively include directories
 - `--files <glob,...>`: include files matching glob patterns
+- `--changed`: include staged, unstaged, and untracked changes
+- `--base <ref>`: include `<ref>...HEAD` and current working-tree changes
 - `--model <name>`: pass a Gemini model override only when requested
 - `--format <text|json|stream-json>`: choose Gemini output format
 - `--max-files <n>`: limit files inlined into the prompt
 - `--max-file-bytes <n>`: limit bytes per file
+- `--max-diff-bytes <n>`: limit Git diff bytes
 - `--timeout-ms <n>`: kill Gemini if it runs longer than this many milliseconds; `0` disables the bridge timeout
 - `--heartbeat-ms <n>`: report elapsed time, prompt size, and Gemini PID on stderr; `0` disables the heartbeat
 - `--warn-prompt-bytes <n>`: warn when the generated prompt reaches this byte size; `0` disables the warning
+- `--warn-prompt-tokens <n>`: warn on approximate prompt tokens
 - `--fail-on-prompt-bytes <n>`: fail before calling Gemini when the generated prompt exceeds this byte size
+- `--fail-on-prompt-tokens <n>`: fail on approximate prompt tokens
 - `--print-prompt-size`: print the generated prompt byte size before calling Gemini
-- `--output-file <path>`: write Gemini stdout to a workspace-local file
+- `--output-file <path>`: stream Gemini stdout through a `.partial` file
+- `--metadata-file <path>`: write execution metadata as JSON
+- `--plan`: inspect selected context without calling Gemini
+- `--doctor`: verify Gemini CLI and authentication with a small live request
 - `--print-command`: inspect the resolved Gemini command without running it
 
 ## Patterns
@@ -65,6 +74,13 @@ Architecture review:
 
 ```powershell
 node <plugin-root>\scripts\gemini-bridge.js --dirs src,docs "Explain the architecture and cite the key files."
+```
+
+Current-change review:
+
+```powershell
+node <plugin-root>\scripts\gemini-bridge.js --changed --plan "Review the current changes."
+node <plugin-root>\scripts\gemini-bridge.js --changed --output-file _workspace/gemini-review.md "Review the current changes."
 ```
 
 Refactor impact:
@@ -88,9 +104,15 @@ node <plugin-root>\scripts\gemini-bridge.js --files "schemas/**/*.json,data/**/*
 ## Practical Rules
 
 - Narrow the context deliberately with `--dirs` or `--files`.
+- Prefer `--changed` for implementation reviews and `--base <ref>` for branch or pull-request reviews.
+- Use `--plan` before sending broad or sensitive context.
+- Respect `.gitignore`; add `.codex-geminiignore` for plugin-specific exclusions.
 - Leave `--timeout-ms` at `0` for interactive reviews unless a hard execution bound is useful.
 - Use `--timeout-ms` for CI, unattended jobs, or explicitly bounded review passes.
 - Treat heartbeat messages as progress diagnostics; they are written to stderr and do not alter Gemini output.
+- Treat token counts as estimates and choose thresholds based on the selected model.
+- When using `--output-file`, expect `.partial` output to remain after timeout, cancellation, invalid JSON, or Gemini failure.
+- Use `--metadata-file` when another workflow needs a deterministic handoff record.
 - If a timeout happens, reduce `--max-files` or `--max-file-bytes`, split by module, or raise `--timeout-ms`.
 - Do not send secrets, private credentials, or unrelated user data to Gemini.
 - Ask for a concrete output format when using Gemini for review.

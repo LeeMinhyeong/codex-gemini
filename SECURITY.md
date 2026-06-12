@@ -10,9 +10,13 @@ Please open a private security advisory on GitHub if the repository supports it.
 
 ## Data Handling
 
-This plugin can send selected local file contents to Gemini CLI. Users are responsible for choosing appropriate files and directories.
+This plugin can send selected local file contents, task text, and Git diffs to Gemini CLI. Users are responsible for choosing appropriate context.
 
-The bridge script skips common sensitive files and directories by default, including `.env` files, SSH keys, certificates, credential-like filenames, and common cloud credential folders. This filter is a guardrail, not a guarantee. Review selected paths before using the plugin on private repositories.
+The bridge script skips common sensitive files and directories by default, including `.env` files, SSH keys, certificates, credential-like filenames, and common cloud credential folders. Git-ignored untracked files are excluded, and `.codex-geminiignore` can add repository-specific exclusions. Sensitive-file filtering cannot be negated.
+
+File contents and diffs are serialized as untrusted JSON data, and absolute workspace paths are omitted. Prompt-injection resistance is a guardrail, not a guarantee. Use `--plan` to inspect selected paths, truncation, diff size, and estimated prompt size before private or regulated-code reviews.
+
+Selected input paths, output files, and metadata files are restricted to the current workspace.
 
 ## Secrets
 

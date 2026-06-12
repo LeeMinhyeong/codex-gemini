@@ -58,6 +58,23 @@ test("runGemini stops a timed-out process tree", { concurrency: false }, async (
   assert.equal(result.termination?.type, "timeout");
 });
 
+test("runGemini turns output write failures into supervised termination", { concurrency: false }, async () => {
+  const result = await runGemini(process.execPath, [fakeGemini], {
+    input: "write-error",
+    timeoutMs: 5000,
+    heartbeatMs: 0,
+    promptBytes: 11,
+    captureStdout: false,
+    onStdout() {
+      throw new Error("disk unavailable");
+    },
+    env: { ...process.env, FAKE_GEMINI_MODE: "success" },
+  });
+
+  assert.equal(result.termination?.type, "output-write-error");
+  assert.equal(result.outputWriteError, "disk unavailable");
+});
+
 test("runGemini forwards an interrupt into the shared cleanup path", { concurrency: false }, () => {
   const result = spawnSync(process.execPath, [signalRunner], {
     encoding: "utf8",
