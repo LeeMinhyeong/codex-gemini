@@ -105,6 +105,8 @@ const SENSITIVE_NAME_PATTERNS = [
 
 const IGNORED_PATH_SEGMENTS = new Set([
   ".git",
+  ".gradle",
+  ".gradle-home",
   ".next",
   ".turbo",
   "build",
@@ -694,11 +696,26 @@ async function collectContextFiles({ cwd, dirs, patterns, extraFiles = [], maxFi
   const allMatches = new Set();
   const skipped = [];
   const ignoreRules = loadAdditionalIgnoreRules(cwd);
+  const literalPatterns = patterns.filter((pattern) => !/[*?]/.test(pattern));
+  const globPatterns = patterns.filter((pattern) => /[*?]/.test(pattern));
   let workspaceFiles = [];
-  if (dirs.length > 0 || patterns.length > 0) {
+  if (dirs.length > 0 || globPatterns.length > 0) {
     workspaceFiles = (await isGitWorkspace(cwd))
       ? await listGitVisibleFiles(cwd)
       : walkFiles(workspaceRoot, skipped, cwd);
+  }
+
+  for (const filePath of literalPatterns) {
+    const absolutePath = path.resolve(cwd, filePath);
+    if (!isInside(workspaceRoot, absolutePath)) {
+      skipped.push({ path: filePath, reason: "outside-workspace" });
+      continue;
+    }
+    if (!fs.existsSync(absolutePath)) {
+      skipped.push({ path: filePath, reason: "not-found" });
+      continue;
+    }
+    allMatches.add(absolutePath);
   }
 
   for (const dirPath of dirs) {
@@ -722,8 +739,8 @@ async function collectContextFiles({ cwd, dirs, patterns, extraFiles = [], maxFi
     }
   }
 
-  if (patterns.length > 0) {
-    const regexes = patterns.map(globToRegex);
+  if (globPatterns.length > 0) {
+    const regexes = globPatterns.map(globToRegex);
     for (const match of workspaceFiles) {
       const relativePath = relativeToCwd(cwd, match);
       if (regexes.some((regex) => regex.test(relativePath))) {

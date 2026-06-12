@@ -119,6 +119,29 @@ test("prompt treats file contents as serialized untrusted data", () => {
   assert.ok(estimatePromptTokens(prompt) > 0);
 });
 
+test("literal file selection does not scan an entire non-Git workspace", async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-gemini-literal-"));
+  try {
+    fs.writeFileSync(path.join(tempDir, "target.md"), "selected", "utf8");
+    const cacheDir = path.join(tempDir, ".gradle-home", "caches", "nested", "build");
+    fs.mkdirSync(cacheDir, { recursive: true });
+    fs.writeFileSync(path.join(cacheDir, "ignored.txt"), "ignored", "utf8");
+
+    const context = await collectContextFiles({
+      cwd: tempDir,
+      dirs: [],
+      patterns: ["target.md"],
+      maxFiles: 10,
+      maxFileBytes: 1000,
+    });
+
+    assert.deepEqual(context.included.map((file) => file.path), ["target.md"]);
+    assert.deepEqual(context.skipped, []);
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
 test("additional ignore rules support exclusions and later negation", () => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-gemini-ignore-"));
   try {
