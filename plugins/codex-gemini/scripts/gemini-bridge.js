@@ -2,9 +2,10 @@
 
 const { spawn } = require("node:child_process");
 const fs = require("node:fs");
+const os = require("node:os");
 const path = require("node:path");
 
-const PLUGIN_VERSION = "1.0.0-rc.1";
+const PLUGIN_VERSION = "1.0.0-rc.2";
 const DEFAULT_MAX_FILES = 40;
 const DEFAULT_MAX_FILE_BYTES = 32768;
 const DEFAULT_MAX_DIFF_BYTES = 262144;
@@ -19,6 +20,9 @@ const WATCHDOG_SCRIPT = path.join(__dirname, "gemini-watchdog.js");
 const STDIN_PROMPT_INSTRUCTION = "Use the prompt provided on stdin and answer it.";
 const SUPPORTED_FORMATS = new Set(["text", "json", "stream-json"]);
 const FORWARDED_SIGNALS = ["SIGINT", "SIGTERM", "SIGHUP"];
+const CLOSED_BOOK_INITIALIZATION_WARNINGS = new Set([
+  "Ripgrep is not available. Falling back to GrepTool.",
+]);
 
 const KNOWN_BINARY_EXTENSIONS = new Set([
   ".7z",
@@ -157,6 +161,7 @@ Options:
   --print-prompt-size      Print the prompt byte size before calling Gemini.
   --output-file <path>     Write Gemini stdout to a workspace-local file.
   --metadata-file <path>   Write execution metadata as JSON.
+  --closed-book            Deny all Gemini tools and run in an isolated temporary workspace.
   --plan                   Print the context plan without calling Gemini.
   --doctor                 Check Gemini CLI, authentication, and process supervision.
   --print-command          Print the resolved Gemini command and exit.
@@ -264,6 +269,7 @@ function parseCliArgs(argv) {
     printPromptSize: false,
     outputFile: undefined,
     metadataFile: undefined,
+    closedBook: false,
     plan: false,
     doctor: false,
     printCommand: false,
@@ -364,6 +370,9 @@ function parseCliArgs(argv) {
       case "--metadata-file":
         parsed.metadataFile = takeOptionValue(argv, index, token);
         index += 1;
+        break;
+      case "--closed-book":
+        parsed.closedBook = true;
         break;
       case "--plan":
         parsed.plan = true;
@@ -813,10 +822,11 @@ async function collectContextFiles({ cwd, dirs, patterns, extraFiles = [], maxFi
   return { included, skipped };
 }
 
-function buildGeminiPrompt({ task, context, gitReview }) {
+function buildGeminiPrompt({ task, context, gitReview, closedBook = false }) {
   const request = {
     task,
-    workspace: ".",
+    workspace: closedBook ? null : ".",
+    mode: closedBook ? "CLOSED_BOOK" : "WORKSPACE",
     gitReview: gitReview
       ? {
           base: gitReview.base,
@@ -843,6 +853,18 @@ function buildGeminiPrompt({ task, context, gitReview }) {
     content: file.content,
   }));
 
+  const responseRules = closedBook
+    ? [
+        "- Use only the serialized file records and Git diff included in this prompt.",
+        "- No workspace evidence is available or permitted.",
+        "- Do not call tools, search files, run commands, browse, or retrieve external context.",
+        "- Cite only relative paths present in the context inventory.",
+        "- If required evidence is absent, state that the context is insufficient instead of retrieving it.",
+      ]
+    : [
+        "- Use workspace evidence when relevant and cite relative file paths.",
+      ];
+
   return [
     "You are Gemini assisting Codex with a code or data analysis pass.",
     "",
@@ -864,20 +886,75 @@ function buildGeminiPrompt({ task, context, gitReview }) {
     fileRecords.length > 0 ? fileRecords.join("\n") : JSON.stringify({ files: [] }),
     "",
     "Response rules:",
-    "- Use workspace evidence when relevant and cite relative file paths.",
+    ...responseRules,
     "- Call out partial, skipped, or truncated context.",
     "- Separate direct evidence from inference.",
     "- Do not invent files, APIs, or data absent from the serialized evidence.",
   ].join("\n");
 }
 
-function buildGeminiArgs({ model, format }) {
+function buildGeminiArgs({ model, format, closedBook = false, policyPath }) {
   const args = ["-p", STDIN_PROMPT_INSTRUCTION];
   if (model) {
     args.push("-m", model);
   }
+  if (closedBook) {
+    if (!policyPath) {
+      throw new Error("Closed-book mode requires an isolated deny-all policy.");
+    }
+    args.push(
+      "--skip-trust",
+      "--approval-mode", "default",
+      "--policy", policyPath,
+      "--extensions", "none",
+      "--allowed-mcp-server-names", "__codex_gemini_no_mcp__",
+    );
+  }
   args.push("--output-format", format);
   return args;
+}
+
+function createClosedBookExecutionContext() {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "codex-gemini-closed-book-"));
+  const policyPath = path.join(directory, "deny-all-tools.toml");
+  fs.writeFileSync(
+    policyPath,
+    [
+      "[[rule]]",
+      'toolName = "*"',
+      'argsPattern = ".*"',
+      'decision = "deny"',
+      "priority = 999",
+      "interactive = false",
+      'denyMessage = "Tools are disabled for this closed-book review."',
+      "",
+    ].join("\n"),
+    "utf8",
+  );
+  return {
+    cwd: directory,
+    policyPath,
+    cleanup() {
+      fs.rmSync(directory, { recursive: true, force: true });
+    },
+  };
+}
+
+function sanitizeClosedBookStderr(stderr) {
+  const suppressedWarnings = [];
+  const keptLines = [];
+  for (const line of stderr.split(/\r?\n/)) {
+    if (CLOSED_BOOK_INITIALIZATION_WARNINGS.has(line.trim())) {
+      suppressedWarnings.push(line.trim());
+    } else if (line || keptLines.length > 0) {
+      keptLines.push(line);
+    }
+  }
+  const sanitizedStderr = keptLines.join("\n").replace(/\n+$/, "");
+  return {
+    stderr: sanitizedStderr ? `${sanitizedStderr}\n` : "",
+    suppressedWarnings,
+  };
 }
 
 function resolveGeminiInvocation() {
@@ -1222,12 +1299,14 @@ function runGemini(
     heartbeatMs,
     promptBytes,
     env = process.env,
+    cwd,
     onStdout,
     captureStdout = true,
   },
 ) {
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, {
+      cwd,
       detached: process.platform !== "win32",
       env,
       stdio: ["pipe", "pipe", "pipe"],
@@ -1244,6 +1323,8 @@ function runGemini(
     let terminationPromise;
     let outputWriteError;
     let settled = false;
+    let firstStdoutAt;
+    let lastStdoutAt;
     const startedAt = Date.now();
 
     let timeoutTimer;
@@ -1304,6 +1385,8 @@ function runGemini(
         stderr: Buffer.concat(stderrChunks).toString("utf8"),
         termination,
         outputWriteError: outputWriteError?.message,
+        firstStdoutAt: firstStdoutAt ? new Date(firstStdoutAt).toISOString() : null,
+        lastStdoutAt: lastStdoutAt ? new Date(lastStdoutAt).toISOString() : null,
       });
     }
 
@@ -1349,6 +1432,9 @@ function runGemini(
     }
 
     child.stdout.on("data", (chunk) => {
+      const receivedAt = Date.now();
+      firstStdoutAt ||= receivedAt;
+      lastStdoutAt = receivedAt;
       stdoutBytes += chunk.length;
       if (captureStdout) {
         stdoutChunks.push(chunk);
@@ -1511,26 +1597,36 @@ async function run(argv) {
     maxFiles: parsed.maxFiles,
     maxFileBytes: parsed.maxFileBytes,
   });
-  const prompt = buildGeminiPrompt({ task: parsed.task, context, gitReview });
-  const geminiArgs = buildGeminiArgs({
-    model: parsed.model,
-    format: parsed.format,
-  });
-  const geminiInvocation = resolveGeminiInvocation();
-  const commandArgs = [...geminiInvocation.prefixArgs, ...geminiArgs];
+  const prompt = buildGeminiPrompt({ task: parsed.task, context, gitReview, closedBook: parsed.closedBook });
   const promptBytes = Buffer.byteLength(prompt, "utf8");
   const promptTokens = estimatePromptTokens(prompt);
-
-  if (parsed.printCommand) {
-    printResolvedCommand(geminiInvocation.command, commandArgs, prompt);
-    return 0;
-  }
 
   if (parsed.plan) {
     process.stdout.write(
       `${JSON.stringify(buildContextPlan({ context, gitReview, promptBytes, promptTokens }), null, 2)}\n`,
     );
     return 0;
+  }
+
+  const geminiInvocation = resolveGeminiInvocation();
+
+  if (parsed.printCommand) {
+    const printContext = parsed.closedBook
+      ? createClosedBookExecutionContext()
+      : { cwd, policyPath: undefined, cleanup() {} };
+    try {
+      const printArgs = buildGeminiArgs({
+        model: parsed.model,
+        format: parsed.format,
+        closedBook: parsed.closedBook,
+        policyPath: printContext.policyPath,
+      });
+      const commandArgs = [...geminiInvocation.prefixArgs, ...printArgs];
+      printResolvedCommand(geminiInvocation.command, commandArgs, prompt);
+      return 0;
+    } finally {
+      printContext.cleanup();
+    }
   }
 
   const outputFilePath = resolveWorkspaceFile(cwd, parsed.outputFile, "--output-file");
@@ -1564,6 +1660,8 @@ async function run(argv) {
     pluginVersion: PLUGIN_VERSION,
     startedAt: startedAt.toISOString(),
     workspace: ".",
+    executionMode: parsed.closedBook ? "closed-book" : "workspace",
+    geminiWorkspace: parsed.closedBook ? "isolated-temporary-directory" : ".",
     model: parsed.model || null,
     format: parsed.format,
     prompt: { bytes: promptBytes, estimatedTokens: promptTokens },
@@ -1599,13 +1697,24 @@ async function run(argv) {
     return exitCode;
   }
 
+  const executionContext = parsed.closedBook
+    ? createClosedBookExecutionContext()
+    : { cwd, policyPath: undefined, cleanup() {} };
   let result;
   try {
+    const geminiArgs = buildGeminiArgs({
+      model: parsed.model,
+      format: parsed.format,
+      closedBook: parsed.closedBook,
+      policyPath: executionContext.policyPath,
+    });
+    const commandArgs = [...geminiInvocation.prefixArgs, ...geminiArgs];
     result = await runGemini(geminiInvocation.command, commandArgs, {
       input: prompt,
       timeoutMs: parsed.timeoutMs,
       heartbeatMs: parsed.heartbeatMs,
       promptBytes,
+      cwd: executionContext.cwd,
       captureStdout: !outputSession,
       onStdout: outputSession ? (chunk) => outputSession.write(chunk) : undefined,
     });
@@ -1616,7 +1725,14 @@ async function run(argv) {
       partialOutputFile: partialPath ? relativeToCwd(cwd, partialPath) : null,
     });
     throw error;
+  } finally {
+    executionContext.cleanup();
   }
+
+  const stderrDiagnostics = parsed.closedBook
+    ? sanitizeClosedBookStderr(result.stderr)
+    : { stderr: result.stderr, suppressedWarnings: [] };
+  result.stderr = stderrDiagnostics.stderr;
 
   if (result.termination?.type === "signal") {
     const partialPath = outputSession?.preserve();
@@ -1647,7 +1763,17 @@ async function run(argv) {
     if (partialPath) {
       process.stderr.write(`[gemini-bridge] Partial output preserved at ${relativeToCwd(cwd, partialPath)}\n`);
     }
-    return finish("timeout", 124, {
+    const toolUseDetected = /Ripgrep|GrepTool|grep_search|read_file|run_shell_command|web_fetch/i.test(result.stderr);
+    const timeoutStatus = toolUseDetected
+      ? "timeout-with-tool-use"
+      : result.stdoutBytes > 0
+        ? "timeout-after-output"
+        : "timeout-no-output";
+    return finish(timeoutStatus, 124, {
+      firstStdoutAt: result.firstStdoutAt,
+      lastStdoutAt: result.lastStdoutAt,
+      toolUseDetected,
+      suppressedInitializationWarnings: stderrDiagnostics.suppressedWarnings,
       partialOutputFile: partialPath ? relativeToCwd(cwd, partialPath) : null,
     });
   }
@@ -1680,6 +1806,7 @@ async function run(argv) {
       `[gemini-bridge] Gemini exited with status ${result.status}. Prompt size: ${formatBytes(promptBytes)} (${promptBytes} bytes).\n`,
     );
     return finish("gemini-error", result.status || 1, {
+      suppressedInitializationWarnings: stderrDiagnostics.suppressedWarnings,
       partialOutputFile: partialPath ? relativeToCwd(cwd, partialPath) : null,
     });
   }
@@ -1705,7 +1832,12 @@ async function run(argv) {
   } else if (result.stdout) {
     process.stdout.write(result.stdout);
   }
-  return finish("success", 0, { stdoutBytes: result.stdoutBytes });
+  return finish("success", 0, {
+    stdoutBytes: result.stdoutBytes,
+    firstStdoutAt: result.firstStdoutAt,
+    lastStdoutAt: result.lastStdoutAt,
+    suppressedInitializationWarnings: stderrDiagnostics.suppressedWarnings,
+  });
 }
 
 if (require.main === module) {
@@ -1726,13 +1858,16 @@ if (require.main === module) {
 
 module.exports = {
   buildGeminiPrompt,
+  buildGeminiArgs,
   collectContextFiles,
   collectGitReview,
+  createClosedBookExecutionContext,
   createOutputSession,
   estimatePromptTokens,
   isAdditionalIgnored,
   loadAdditionalIgnoreRules,
   parseCliArgs,
   runGemini,
+  sanitizeClosedBookStderr,
   validateJsonOutput,
 };

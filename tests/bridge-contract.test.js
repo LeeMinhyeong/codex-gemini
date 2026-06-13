@@ -6,6 +6,7 @@ const path = require("node:path");
 const test = require("node:test");
 
 const {
+  buildGeminiArgs,
   buildGeminiPrompt,
   collectContextFiles,
   collectGitReview,
@@ -14,6 +15,7 @@ const {
   isAdditionalIgnored,
   loadAdditionalIgnoreRules,
   parseCliArgs,
+  sanitizeClosedBookStderr,
   validateJsonOutput,
 } = require("../plugins/codex-gemini/scripts/gemini-bridge.js");
 
@@ -42,6 +44,7 @@ function createFakeGeminiBin(root) {
     "utf8",
   );
   const script = `#!/usr/bin/env node
+const fs = require("node:fs");
 const mode = process.env.FAKE_GEMINI_MODE;
 if (process.argv.includes("--version")) {
   process.stdout.write("0.0.0-test\\n");
@@ -49,13 +52,27 @@ if (process.argv.includes("--version")) {
 }
 process.stdin.resume();
 process.stdin.on("end", () => {
-  if (mode === "partial-timeout") {
+  if (mode === "partial-timeout" || mode === "partial-timeout-tool") {
     process.stdout.write("PARTIAL_OUTPUT");
+    if (mode === "partial-timeout-tool") {
+      process.stderr.write("run_shell_command denied by policy\\n");
+    }
     setInterval(() => {}, 1000);
     return;
   }
   if (mode === "doctor") {
     process.stdout.write("CODEX_GEMINI_DOCTOR_OK");
+    return;
+  }
+  if (mode === "closed-book-inspect") {
+    const policyIndex = process.argv.indexOf("--policy");
+    const policyPath = policyIndex >= 0 ? process.argv[policyIndex + 1] : null;
+    process.stdout.write(JSON.stringify({
+      cwd: process.cwd(),
+      args: process.argv.slice(2),
+      policyPath,
+      policy: policyPath ? fs.readFileSync(policyPath, "utf8") : null,
+    }));
     return;
   }
   process.stdout.write(mode === "invalid-json" ? "not-json" : '{"ok":true}');
@@ -96,6 +113,23 @@ test("unknown CLI options fail instead of becoming task text", () => {
   assert.equal(parseCliArgs(["--", "-review"]).task, "-review");
 });
 
+test("--closed-book selects isolated no-tool execution", () => {
+  const parsed = parseCliArgs(["--closed-book", "Review only supplied records."]);
+  assert.equal(parsed.closedBook, true);
+
+  const args = buildGeminiArgs({
+    format: "text",
+    closedBook: true,
+    policyPath: "C:/temp/deny-all.toml",
+  });
+  assert.deepEqual(args.slice(0, 2), ["-p", "Use the prompt provided on stdin and answer it."]);
+  assert.ok(args.includes("--policy"));
+  assert.ok(args.includes("C:/temp/deny-all.toml"));
+  assert.ok(args.includes("--extensions"));
+  assert.ok(args.includes("none"));
+  assert.ok(args.includes("--allowed-mcp-server-names"));
+});
+
 test("prompt treats file contents as serialized untrusted data", () => {
   const prompt = buildGeminiPrompt({
     task: "Review safely",
@@ -117,6 +151,43 @@ test("prompt treats file contents as serialized untrusted data", () => {
   assert.doesNotMatch(prompt, /Workspace root:/);
   assert.match(prompt, /"path":"src\/example.js"/);
   assert.ok(estimatePromptTokens(prompt) > 0);
+});
+
+test("closed-book prompt forbids workspace evidence", () => {
+  const prompt = buildGeminiPrompt({
+    task: "Review safely",
+    closedBook: true,
+    context: {
+      included: [{
+        path: "src/example.js",
+        mediaType: "text/plain",
+        bytes: 12,
+        truncated: false,
+        content: "const x = 1;",
+      }],
+      skipped: [],
+    },
+    gitReview: undefined,
+  });
+
+  assert.match(prompt, /No workspace evidence is available or permitted/);
+  assert.match(prompt, /Do not call tools/);
+  assert.doesNotMatch(prompt, /Use workspace evidence when relevant/);
+  assert.match(prompt, /"mode": "CLOSED_BOOK"/);
+});
+
+test("closed-book stderr hides only the known tool initialization warning", () => {
+  const result = sanitizeClosedBookStderr([
+    "Warning: keep this diagnostic.",
+    "Ripgrep is not available. Falling back to GrepTool.",
+    "Tool call denied by policy.",
+    "",
+  ].join("\n"));
+
+  assert.equal(result.stderr, "Warning: keep this diagnostic.\nTool call denied by policy.\n");
+  assert.deepEqual(result.suppressedWarnings, [
+    "Ripgrep is not available. Falling back to GrepTool.",
+  ]);
 });
 
 test("literal file selection does not scan an entire non-Git workspace", async () => {
@@ -212,7 +283,7 @@ test("--changed --plan works through the public CLI", () => {
     );
     assert.equal(result.status, 0, result.stderr || result.stdout || result.error?.message);
     const plan = JSON.parse(result.stdout);
-    assert.equal(plan.pluginVersion, "1.0.0-rc.1");
+    assert.equal(plan.pluginVersion, "1.0.0-rc.2");
     assert.ok(plan.gitReview.changedFiles.includes("app.js"));
     assert.ok(plan.includedFiles.some((file) => file.path === "app.js"));
     assert.ok(plan.prompt.estimatedTokens > 0);
@@ -255,7 +326,32 @@ test("public CLI streams valid JSON to the final output and writes metadata", ()
     assert.equal(fs.existsSync(path.join(tempDir, "review.json.partial")), false);
     const metadata = JSON.parse(fs.readFileSync(path.join(tempDir, "review.meta.json"), "utf8"));
     assert.equal(metadata.status, "success");
-    assert.equal(metadata.pluginVersion, "1.0.0-rc.1");
+    assert.equal(metadata.pluginVersion, "1.0.0-rc.2");
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("public CLI isolates closed-book execution and removes its temporary workspace", () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-gemini-closed-book-test-"));
+  try {
+    fs.writeFileSync(path.join(tempDir, "allowed.txt"), "allowed evidence", "utf8");
+    const result = runBridgeWithFakeGemini(
+      tempDir,
+      ["--closed-book", "--files", "allowed.txt", "--format", "json", "Review only allowed.txt."],
+      "closed-book-inspect",
+    );
+    assert.equal(result.status, 0, result.stderr || result.error?.message);
+    const inspection = JSON.parse(result.stdout);
+    assert.notEqual(path.resolve(inspection.cwd), path.resolve(tempDir));
+    assert.ok(path.resolve(inspection.cwd).startsWith(path.resolve(os.tmpdir())));
+    assert.ok(inspection.args.includes("--skip-trust"));
+    assert.ok(inspection.args.includes("--policy"));
+    assert.ok(inspection.args.includes("none"));
+    assert.match(inspection.policy, /toolName = "\*"/);
+    assert.match(inspection.policy, /argsPattern = "\.\*"/);
+    assert.match(inspection.policy, /decision = "deny"/);
+    assert.equal(fs.existsSync(inspection.policyPath), false);
   } finally {
     fs.rmSync(tempDir, { recursive: true, force: true });
   }
@@ -284,12 +380,45 @@ test("public CLI preserves streamed output when Gemini times out", () => {
   try {
     const result = runBridgeWithFakeGemini(
       tempDir,
-      ["--timeout-ms", "100", "--heartbeat-ms", "0", "--output-file", "review.txt", "Review."],
+      [
+        "--timeout-ms", "100",
+        "--heartbeat-ms", "0",
+        "--output-file", "review.txt",
+        "--metadata-file", "review.meta.json",
+        "Review.",
+      ],
       "partial-timeout",
     );
     assert.equal(result.status, 124, result.stderr || result.error?.message);
     assert.equal(fs.existsSync(path.join(tempDir, "review.txt")), false);
     assert.equal(fs.readFileSync(path.join(tempDir, "review.txt.partial"), "utf8"), "PARTIAL_OUTPUT");
+    const metadata = JSON.parse(fs.readFileSync(path.join(tempDir, "review.meta.json"), "utf8"));
+    assert.equal(metadata.status, "timeout-after-output");
+    assert.ok(metadata.firstStdoutAt);
+    assert.equal(metadata.toolUseDetected, false);
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("timeout metadata distinguishes detected tool activity", () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-gemini-timeout-tool-"));
+  try {
+    const result = runBridgeWithFakeGemini(
+      tempDir,
+      [
+        "--closed-book",
+        "--timeout-ms", "100",
+        "--heartbeat-ms", "0",
+        "--metadata-file", "review.meta.json",
+        "Review.",
+      ],
+      "partial-timeout-tool",
+    );
+    assert.equal(result.status, 124, result.stderr || result.error?.message);
+    const metadata = JSON.parse(fs.readFileSync(path.join(tempDir, "review.meta.json"), "utf8"));
+    assert.equal(metadata.status, "timeout-with-tool-use");
+    assert.equal(metadata.toolUseDetected, true);
   } finally {
     fs.rmSync(tempDir, { recursive: true, force: true });
   }

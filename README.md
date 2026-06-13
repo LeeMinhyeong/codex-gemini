@@ -2,7 +2,7 @@
 
 Codex Gemini is a Codex plugin that delegates broad codebase analysis and review tasks to the local Gemini CLI.
 
-`1.0.0-rc.1` is the first release candidate for the stable CLI, security, and output contracts described below.
+`1.0.0-rc.2` adds an enforced closed-book mode for finite-evidence reviews.
 
 Use it when a task benefits from a large-context pass over many files, such as architecture review, refactor impact analysis, security review, documentation synthesis, or structured data analysis.
 
@@ -59,6 +59,12 @@ Review selected files:
 node plugins/codex-gemini/scripts/gemini-bridge.js --files "src/**/*.ts,src/**/*.tsx" "Review auth and input handling. Return file, risk, and fix."
 ```
 
+Run a closed-book review with no Gemini tools, extensions, MCP servers, or original workspace access:
+
+```powershell
+node plugins/codex-gemini/scripts/gemini-bridge.js --closed-book --files "review-request.json,src/auth.ts" "Use only the serialized records and return the requested review JSON."
+```
+
 Review staged, unstaged, and untracked changes:
 
 ```powershell
@@ -109,6 +115,7 @@ node plugins/codex-gemini/scripts/gemini-bridge.js --changed --plan "Review the 
 - `--print-prompt-size`: print the generated prompt byte size before calling Gemini
 - `--output-file <path>`: stream Gemini stdout to a workspace-local file
 - `--metadata-file <path>`: write execution details and the final status as JSON
+- `--closed-book`: deny every Gemini tool and run the CLI in an isolated temporary workspace
 - `--plan`: print the context plan without calling Gemini
 - `--doctor`: check Node, Gemini CLI, live authentication, and watchdog availability
 - `--print-command`: show the resolved command without running Gemini
@@ -130,6 +137,8 @@ Add a workspace-root `.codex-geminiignore` for plugin-specific exclusions. It su
 - Timeout, cancellation, Gemini failure, or invalid JSON preserves the partial file.
 - `--format json` must produce valid JSON before an output file is promoted.
 - `--metadata-file` records timing, selected files, prompt size, Git review details, exit status, and partial-output location.
+- Closed-book runs record `executionMode: "closed-book"`, use a deny-all Gemini policy, disable extensions and MCP access, and remove the temporary workspace after exit.
+- Timeout metadata distinguishes no output, partial output, and detected tool activity.
 
 ## Privacy and Data
 

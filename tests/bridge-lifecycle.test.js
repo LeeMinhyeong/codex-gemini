@@ -44,6 +44,8 @@ test("runGemini returns normal output", { concurrency: false }, async () => {
   assert.equal(result.status, 0);
   assert.equal(result.termination, undefined);
   assert.match(result.stdout, /FAKE_GEMINI_OK:hello/);
+  assert.ok(result.firstStdoutAt);
+  assert.ok(result.lastStdoutAt);
 });
 
 test("runGemini stops a timed-out process tree", { concurrency: false }, async () => {

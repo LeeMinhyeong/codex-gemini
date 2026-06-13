@@ -64,6 +64,7 @@ The bridge:
 - `--print-prompt-size`: print the generated prompt byte size before calling Gemini
 - `--output-file <path>`: stream Gemini stdout through a `.partial` file
 - `--metadata-file <path>`: write execution metadata as JSON
+- `--closed-book`: deny all Gemini tools and run in an isolated temporary workspace
 - `--plan`: inspect selected context without calling Gemini
 - `--doctor`: verify Gemini CLI and authentication with a small live request
 - `--print-command`: inspect the resolved Gemini command without running it
@@ -95,6 +96,12 @@ Security review:
 node <plugin-root>\scripts\gemini-bridge.js --files "src/**/*.ts,src/**/*.tsx" --timeout-ms 300000 --output-file _workspace/gemini-security-review.md "Review auth and input handling. Output file:line, risk, and recommended fix."
 ```
 
+Closed-book review:
+
+```powershell
+node <plugin-root>\scripts\gemini-bridge.js --closed-book --files "review-request.json,src/auth.ts" --output-file _workspace/gemini-review.json "Use only the serialized records and return the requested JSON object."
+```
+
 Structured data:
 
 ```powershell
@@ -113,6 +120,7 @@ node <plugin-root>\scripts\gemini-bridge.js --files "schemas/**/*.json,data/**/*
 - Treat token counts as estimates and choose thresholds based on the selected model.
 - When using `--output-file`, expect `.partial` output to remain after timeout, cancellation, invalid JSON, or Gemini failure.
 - Use `--metadata-file` when another workflow needs a deterministic handoff record.
+- Use `--closed-book` whenever the selected files are an exhaustive evidence allowlist. This mode denies all tools, disables extensions and MCP access, and isolates Gemini from the original workspace.
 - If a timeout happens, reduce `--max-files` or `--max-file-bytes`, split by module, or raise `--timeout-ms`.
 - Do not send secrets, private credentials, or unrelated user data to Gemini.
 - Ask for a concrete output format when using Gemini for review.
