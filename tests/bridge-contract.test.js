@@ -555,7 +555,7 @@ test("public CLI isolates closed-book execution and removes its temporary worksp
     assert.equal(result.status, 0, result.stderr || result.error?.message);
     const inspection = JSON.parse(result.stdout);
     assert.notEqual(path.resolve(inspection.cwd), path.resolve(tempDir));
-    assert.ok(path.resolve(inspection.cwd).startsWith(path.resolve(os.tmpdir())));
+    assert.ok(path.resolve(inspection.cwd).startsWith(`${fs.realpathSync(os.tmpdir())}${path.sep}`));
     assert.ok(inspection.args.includes("--skip-trust"));
     assert.ok(inspection.args.includes("--policy"));
     assert.ok(inspection.args.includes("none"));
