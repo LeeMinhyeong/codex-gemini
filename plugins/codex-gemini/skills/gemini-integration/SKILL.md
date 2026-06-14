@@ -64,6 +64,10 @@ The bridge:
 - `--print-prompt-size`: print the generated prompt byte size before calling Gemini
 - `--output-file <path>`: stream Gemini stdout through a `.partial` file
 - `--metadata-file <path>`: write execution metadata as JSON
+- `--response-schema <path>`: validate JSON output against a workspace-local JSON Schema
+- `--scope-manifest <path>`: validate structured output paths against `allowed_files`
+- `--strict-scope-text`: reject path-like references in free-text fields outside the exact allowlist
+- `--validation-file <path>`: write validation results as JSON
 - `--closed-book`: deny all Gemini tools and run in an isolated temporary workspace
 - `--plan`: inspect selected context without calling Gemini
 - `--doctor`: verify Gemini CLI and authentication with a small live request
@@ -99,7 +103,7 @@ node <plugin-root>\scripts\gemini-bridge.js --files "src/**/*.ts,src/**/*.tsx" -
 Closed-book review:
 
 ```powershell
-node <plugin-root>\scripts\gemini-bridge.js --closed-book --files "review-request.json,src/auth.ts" --output-file _workspace/gemini-review.json "Use only the serialized records and return the requested JSON object."
+node <plugin-root>\scripts\gemini-bridge.js --closed-book --format json --files "review-request.json,src/auth.ts" --response-schema "review-response.schema.json" --scope-manifest "review-request.json" --strict-scope-text --output-file _workspace/gemini-review.raw.json --validation-file _workspace/gemini-review.validation.json --metadata-file _workspace/gemini-review.metadata.json "Use only the serialized records and return the requested JSON object."
 ```
 
 Structured data:
@@ -121,6 +125,8 @@ node <plugin-root>\scripts\gemini-bridge.js --files "schemas/**/*.json,data/**/*
 - When using `--output-file`, expect `.partial` output to remain after timeout, cancellation, invalid JSON, or Gemini failure.
 - Use `--metadata-file` when another workflow needs a deterministic handoff record.
 - Use `--closed-book` whenever the selected files are an exhaustive evidence allowlist. This mode denies all tools, disables extensions and MCP access, and isolates Gemini from the original workspace.
+- For contract-bound JSON, use `--response-schema`, `--scope-manifest`, and `--validation-file`. Treat only `completed-valid` with exit code 0 as promotable output.
+- Validation preserves raw Gemini output unchanged. Do not auto-correct enum values, required fields, or file paths.
 - If a timeout happens, reduce `--max-files` or `--max-file-bytes`, split by module, or raise `--timeout-ms`.
 - Do not send secrets, private credentials, or unrelated user data to Gemini.
 - Ask for a concrete output format when using Gemini for review.

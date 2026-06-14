@@ -2,7 +2,7 @@
 
 Codex Gemini is a Codex plugin that delegates broad codebase analysis and review tasks to the local Gemini CLI.
 
-`1.0.0-rc.2` adds an enforced closed-book mode for finite-evidence reviews.
+`1.0.0-rc.3` adds deterministic JSON Schema and closed-scope output validation while preserving Gemini's raw output.
 
 Use it when a task benefits from a large-context pass over many files, such as architecture review, refactor impact analysis, security review, documentation synthesis, or structured data analysis.
 
@@ -65,6 +65,22 @@ Run a closed-book review with no Gemini tools, extensions, MCP servers, or origi
 node plugins/codex-gemini/scripts/gemini-bridge.js --closed-book --files "review-request.json,src/auth.ts" "Use only the serialized records and return the requested review JSON."
 ```
 
+Validate a closed-book review before treating it as complete:
+
+```powershell
+node plugins/codex-gemini/scripts/gemini-bridge.js `
+  --closed-book `
+  --format json `
+  --files "review-request.json,src/auth.ts" `
+  --response-schema "review-response.schema.json" `
+  --scope-manifest "review-request.json" `
+  --strict-scope-text `
+  --output-file "review.raw.json" `
+  --validation-file "review.validation.json" `
+  --metadata-file "review.metadata.json" `
+  "Review only the supplied records."
+```
+
 Review staged, unstaged, and untracked changes:
 
 ```powershell
@@ -115,6 +131,10 @@ node plugins/codex-gemini/scripts/gemini-bridge.js --changed --plan "Review the 
 - `--print-prompt-size`: print the generated prompt byte size before calling Gemini
 - `--output-file <path>`: stream Gemini stdout to a workspace-local file
 - `--metadata-file <path>`: write execution details and the final status as JSON
+- `--response-schema <path>`: validate JSON output against a workspace-local JSON Schema
+- `--scope-manifest <path>`: validate structured result paths against its `allowed_files`
+- `--strict-scope-text`: also reject path-like references in free-text fields; requires `--scope-manifest`
+- `--validation-file <path>`: write schema and scope validation results as JSON
 - `--closed-book`: deny every Gemini tool and run the CLI in an isolated temporary workspace
 - `--plan`: print the context plan without calling Gemini
 - `--doctor`: check Node, Gemini CLI, live authentication, and watchdog availability
@@ -137,8 +157,16 @@ Add a workspace-root `.codex-geminiignore` for plugin-specific exclusions. It su
 - Timeout, cancellation, Gemini failure, or invalid JSON preserves the partial file.
 - `--format json` must produce valid JSON before an output file is promoted.
 - `--metadata-file` records timing, selected files, prompt size, Git review details, exit status, and partial-output location.
+- Output validation requires `--format json`, `--output-file`, and `--validation-file`.
+- The raw Gemini output is preserved unchanged at `--output-file`, including validation failures.
+- Validation metadata separates `processStatus` from `validationStatus` and reports `completed-valid`, `completed-invalid-schema`, or `completed-invalid-scope`.
+- Schema failures exit with code 2; scope failures exit with code 3.
+- Scope validation checks reviewed files, out-of-scope files, and each finding's `file` field. `--strict-scope-text` additionally scans finding evidence, issue, recommendation, missing context, and residual risks for path-like references.
+- Supported JSON Schema keywords are checked explicitly. Unsupported keywords fail before Gemini is called rather than being silently ignored.
 - Closed-book runs record `executionMode: "closed-book"`, use a deny-all Gemini policy, disable extensions and MCP access, and remove the temporary workspace after exit.
 - Timeout metadata distinguishes no output, partial output, and detected tool activity.
+
+The dependency-free validator intentionally supports a review-contract subset of JSON Schema: local `$ref`, `$defs`/`definitions`, `type`, `const`, `enum`, object properties and required keys, additional properties, array items and size limits, and numeric ranges. Schema annotations such as title and description are accepted but do not affect validation.
 
 ## Privacy and Data
 

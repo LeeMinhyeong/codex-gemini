@@ -4,8 +4,13 @@ const { spawn } = require("node:child_process");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
+const {
+  assertSupportedJsonSchema,
+  validateJsonSchema,
+  validateScopeManifest,
+} = require("./json-schema.js");
 
-const PLUGIN_VERSION = "1.0.0-rc.2";
+const PLUGIN_VERSION = "1.0.0-rc.3";
 const DEFAULT_MAX_FILES = 40;
 const DEFAULT_MAX_FILE_BYTES = 32768;
 const DEFAULT_MAX_DIFF_BYTES = 262144;
@@ -161,6 +166,10 @@ Options:
   --print-prompt-size      Print the prompt byte size before calling Gemini.
   --output-file <path>     Write Gemini stdout to a workspace-local file.
   --metadata-file <path>   Write execution metadata as JSON.
+  --response-schema <path> Validate JSON output against a workspace-local JSON Schema.
+  --scope-manifest <path>  Validate structured output paths against allowed_files.
+  --strict-scope-text      Also reject path-like references in free-text output fields.
+  --validation-file <path> Write output validation details as JSON.
   --closed-book            Deny all Gemini tools and run in an isolated temporary workspace.
   --plan                   Print the context plan without calling Gemini.
   --doctor                 Check Gemini CLI, authentication, and process supervision.
@@ -269,6 +278,10 @@ function parseCliArgs(argv) {
     printPromptSize: false,
     outputFile: undefined,
     metadataFile: undefined,
+    responseSchema: undefined,
+    scopeManifest: undefined,
+    strictScopeText: false,
+    validationFile: undefined,
     closedBook: false,
     plan: false,
     doctor: false,
@@ -369,6 +382,21 @@ function parseCliArgs(argv) {
         break;
       case "--metadata-file":
         parsed.metadataFile = takeOptionValue(argv, index, token);
+        index += 1;
+        break;
+      case "--response-schema":
+        parsed.responseSchema = takeOptionValue(argv, index, token);
+        index += 1;
+        break;
+      case "--scope-manifest":
+        parsed.scopeManifest = takeOptionValue(argv, index, token);
+        index += 1;
+        break;
+      case "--strict-scope-text":
+        parsed.strictScopeText = true;
+        break;
+      case "--validation-file":
+        parsed.validationFile = takeOptionValue(argv, index, token);
         index += 1;
         break;
       case "--closed-book":
@@ -822,7 +850,14 @@ async function collectContextFiles({ cwd, dirs, patterns, extraFiles = [], maxFi
   return { included, skipped };
 }
 
-function buildGeminiPrompt({ task, context, gitReview, closedBook = false }) {
+function buildGeminiPrompt({
+  task,
+  context,
+  gitReview,
+  closedBook = false,
+  responseSchema,
+  scopeManifest,
+}) {
   const request = {
     task,
     workspace: closedBook ? null : ".",
@@ -882,6 +917,16 @@ function buildGeminiPrompt({ task, context, gitReview, closedBook = false }) {
     "Git diff JSON:",
     JSON.stringify(gitReview ? { diff: gitReview.diff } : { diff: null }),
     "",
+    ...(responseSchema !== undefined ? [
+      "Response JSON Schema:",
+      JSON.stringify(responseSchema, null, 2),
+      "",
+    ] : []),
+    ...(scopeManifest ? [
+      "Scope manifest JSON:",
+      JSON.stringify(scopeManifest, null, 2),
+      "",
+    ] : []),
     "File records JSONL:",
     fileRecords.length > 0 ? fileRecords.join("\n") : JSON.stringify({ files: [] }),
     "",
@@ -890,6 +935,8 @@ function buildGeminiPrompt({ task, context, gitReview, closedBook = false }) {
     "- Call out partial, skipped, or truncated context.",
     "- Separate direct evidence from inference.",
     "- Do not invent files, APIs, or data absent from the serialized evidence.",
+    ...(responseSchema !== undefined ? ["- Return one JSON value that satisfies the supplied Response JSON Schema exactly."] : []),
+    ...(scopeManifest ? ["- Use exact paths from scope_manifest.allowed_files without shortening them."] : []),
   ].join("\n");
 }
 
@@ -1120,6 +1167,33 @@ function validateJsonOutput(text) {
   } catch (error) {
     return error.message;
   }
+}
+
+function readJsonFile(filePath, flagName) {
+  try {
+    return JSON.parse(fs.readFileSync(filePath, "utf8"));
+  } catch (error) {
+    throw new Error(`${flagName} must reference valid JSON: ${error.message}`);
+  }
+}
+
+function deriveProcessStatus(status) {
+  if (status === "success" || status.startsWith("completed-")) return "success";
+  if (status.startsWith("timeout-")) return "timeout";
+  if (status === "cancelled") return "cancelled";
+  return "failed";
+}
+
+function validationReport(status, details, errors = []) {
+  return {
+    schemaVersion: "1.0",
+    status,
+    processStatus: "success",
+    validationStatus: errors.length === 0 ? "valid" : "invalid",
+    valid: errors.length === 0,
+    ...details,
+    errors,
+  };
 }
 
 function writeMetadata(metadataFilePath, metadata) {
@@ -1586,6 +1660,59 @@ async function run(argv) {
   }
 
   const cwd = process.cwd();
+  const outputFilePath = resolveWorkspaceFile(cwd, parsed.outputFile, "--output-file");
+  const metadataFilePath = resolveWorkspaceFile(cwd, parsed.metadataFile, "--metadata-file");
+  const responseSchemaPath = resolveWorkspaceFile(cwd, parsed.responseSchema, "--response-schema");
+  const scopeManifestPath = resolveWorkspaceFile(cwd, parsed.scopeManifest, "--scope-manifest");
+  const validationFilePath = resolveWorkspaceFile(cwd, parsed.validationFile, "--validation-file");
+  const outputValidationEnabled = Boolean(responseSchemaPath || scopeManifestPath);
+
+  if (parsed.strictScopeText && !scopeManifestPath) {
+    throw new Error("--strict-scope-text requires --scope-manifest.");
+  }
+
+  if (outputValidationEnabled && !parsed.plan && !parsed.printCommand) {
+    if (parsed.format !== "json") {
+      throw new Error("--response-schema and --scope-manifest require --format json.");
+    }
+    if (!outputFilePath || !validationFilePath) {
+      throw new Error("Output validation requires both --output-file and --validation-file.");
+    }
+  } else if (!outputValidationEnabled && validationFilePath) {
+    throw new Error("--validation-file requires --response-schema or --scope-manifest.");
+  }
+
+  const namedPaths = [
+    ["--output-file", outputFilePath],
+    ["--metadata-file", metadataFilePath],
+    ["--validation-file", validationFilePath],
+    ["--response-schema", responseSchemaPath],
+    ["--scope-manifest", scopeManifestPath],
+  ].filter(([, filePath]) => filePath);
+  for (let left = 0; left < namedPaths.length; left += 1) {
+    for (let right = left + 1; right < namedPaths.length; right += 1) {
+      if (namedPaths[left][1] === namedPaths[right][1]) {
+        throw new Error(`${namedPaths[left][0]} and ${namedPaths[right][0]} must use different paths.`);
+      }
+    }
+  }
+
+  const responseSchema = responseSchemaPath
+    ? readJsonFile(responseSchemaPath, "--response-schema")
+    : undefined;
+  const scopeManifest = scopeManifestPath
+    ? readJsonFile(scopeManifestPath, "--scope-manifest")
+    : undefined;
+  if (responseSchema !== undefined && typeof responseSchema !== "boolean"
+      && (!responseSchema || typeof responseSchema !== "object" || Array.isArray(responseSchema))) {
+    throw new Error("--response-schema root must be a JSON object or boolean.");
+  }
+  if (responseSchema !== undefined) {
+    assertSupportedJsonSchema(responseSchema);
+  }
+  if (scopeManifest && !Array.isArray(scopeManifest.allowed_files)) {
+    throw new Error("--scope-manifest must contain an allowed_files array.");
+  }
   const gitReview = parsed.changed
     ? await collectGitReview(cwd, { base: parsed.base, maxDiffBytes: parsed.maxDiffBytes })
     : undefined;
@@ -1597,7 +1724,14 @@ async function run(argv) {
     maxFiles: parsed.maxFiles,
     maxFileBytes: parsed.maxFileBytes,
   });
-  const prompt = buildGeminiPrompt({ task: parsed.task, context, gitReview, closedBook: parsed.closedBook });
+  const prompt = buildGeminiPrompt({
+    task: parsed.task,
+    context,
+    gitReview,
+    closedBook: parsed.closedBook,
+    responseSchema,
+    scopeManifest,
+  });
   const promptBytes = Buffer.byteLength(prompt, "utf8");
   const promptTokens = estimatePromptTokens(prompt);
 
@@ -1629,12 +1763,6 @@ async function run(argv) {
     }
   }
 
-  const outputFilePath = resolveWorkspaceFile(cwd, parsed.outputFile, "--output-file");
-  const metadataFilePath = resolveWorkspaceFile(cwd, parsed.metadataFile, "--metadata-file");
-  if (outputFilePath && metadataFilePath && outputFilePath === metadataFilePath) {
-    throw new Error("--output-file and --metadata-file must use different paths.");
-  }
-
   if (parsed.failOnPromptBytes > 0 && promptBytes > parsed.failOnPromptBytes) {
     throw new Error(
       `Prompt size ${formatBytes(promptBytes)} (${promptBytes} bytes) exceeds --fail-on-prompt-bytes ${parsed.failOnPromptBytes}. ${promptSizeAdvice()}`,
@@ -1664,6 +1792,10 @@ async function run(argv) {
     geminiWorkspace: parsed.closedBook ? "isolated-temporary-directory" : ".",
     model: parsed.model || null,
     format: parsed.format,
+    responseSchema: responseSchemaPath ? relativeToCwd(cwd, responseSchemaPath) : null,
+    scopeManifest: scopeManifestPath ? relativeToCwd(cwd, scopeManifestPath) : null,
+    validationFile: validationFilePath ? relativeToCwd(cwd, validationFilePath) : null,
+    strictScopeText: parsed.strictScopeText,
     prompt: { bytes: promptBytes, estimatedTokens: promptTokens },
     context: {
       includedFiles: context.included.map(({ path: filePath, bytes, truncated }) => ({
@@ -1685,11 +1817,15 @@ async function run(argv) {
 
   function finish(status, exitCode, extra = {}) {
     const finishedAt = new Date();
+    const processStatus = extra.processStatus || deriveProcessStatus(status);
+    const validationStatus = extra.validationStatus || "skipped";
     writeMetadata(metadataFilePath, {
       ...metadataBase,
       finishedAt: finishedAt.toISOString(),
       durationMs: finishedAt.getTime() - startedAt.getTime(),
       status,
+      processStatus,
+      validationStatus,
       exitCode,
       outputFile: outputFilePath ? relativeToCwd(cwd, outputFilePath) : null,
       ...extra,
@@ -1812,16 +1948,74 @@ async function run(argv) {
   }
 
   const outputText = outputSession ? outputSession.readText() : result.stdout;
+  const rawOutputFile = outputFilePath ? relativeToCwd(cwd, outputFilePath) : null;
+  const validationDetails = {
+    outputFile: rawOutputFile,
+    responseSchema: responseSchemaPath ? relativeToCwd(cwd, responseSchemaPath) : null,
+    scopeManifest: scopeManifestPath ? relativeToCwd(cwd, scopeManifestPath) : null,
+    strictScopeText: parsed.strictScopeText,
+  };
+  const finishValidation = (status, exitCode, errors = []) => {
+    const validationStatus = errors.length === 0 ? "valid" : "invalid";
+    writeMetadata(validationFilePath, validationReport(status, validationDetails, errors));
+    return finish(status, exitCode, {
+      processStatus: "success",
+      validationStatus,
+      validationErrors: errors,
+      stdoutBytes: result.stdoutBytes,
+      firstStdoutAt: result.firstStdoutAt,
+      lastStdoutAt: result.lastStdoutAt,
+      suppressedInitializationWarnings: stderrDiagnostics.suppressedWarnings,
+    });
+  };
+  if (outputValidationEnabled) {
+    outputSession.complete();
+    process.stderr.write(`[gemini-bridge] Wrote raw Gemini stdout to ${rawOutputFile}\n`);
+  }
+  let parsedOutput;
   if (parsed.format === "json") {
-    const jsonError = validateJsonOutput(outputText);
-    if (jsonError) {
+    try {
+      parsedOutput = JSON.parse(outputText);
+    } catch (error) {
+      if (outputValidationEnabled) {
+        const validationErrors = [{
+          path: "/",
+          keyword: "parse",
+          expected: "valid JSON",
+          actual: "invalid JSON",
+          message: error.message,
+        }];
+        process.stderr.write(`[gemini-bridge] Gemini returned invalid JSON: ${error.message}\n`);
+        return finishValidation("completed-invalid-schema", 2, validationErrors);
+      }
       const partialPath = outputSession?.preserve();
-      process.stderr.write(`[gemini-bridge] Gemini returned invalid JSON: ${jsonError}\n`);
+      process.stderr.write(`[gemini-bridge] Gemini returned invalid JSON: ${error.message}\n`);
       return finish("invalid-json", 1, {
-        error: jsonError,
+        error: error.message,
+        processStatus: "success",
+        validationStatus: "invalid",
         partialOutputFile: partialPath ? relativeToCwd(cwd, partialPath) : null,
       });
     }
+  }
+
+  if (outputValidationEnabled) {
+    const schemaErrors = responseSchema === undefined
+      ? []
+      : validateJsonSchema(parsedOutput, responseSchema);
+    if (schemaErrors.length > 0) {
+      process.stderr.write(`[gemini-bridge] Output failed JSON Schema validation with ${schemaErrors.length} error(s).\n`);
+      return finishValidation("completed-invalid-schema", 2, schemaErrors);
+    }
+
+    const scopeErrors = scopeManifest === undefined
+      ? []
+      : validateScopeManifest(parsedOutput, scopeManifest, { strictText: parsed.strictScopeText });
+    if (scopeErrors.length > 0) {
+      process.stderr.write(`[gemini-bridge] Output failed scope validation with ${scopeErrors.length} error(s).\n`);
+      return finishValidation("completed-invalid-scope", 3, scopeErrors);
+    }
+    return finishValidation("completed-valid", 0);
   }
 
   if (outputSession) {

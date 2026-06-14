@@ -18,6 +18,11 @@ const {
   sanitizeClosedBookStderr,
   validateJsonOutput,
 } = require("../plugins/codex-gemini/scripts/gemini-bridge.js");
+const {
+  assertSupportedJsonSchema,
+  validateJsonSchema,
+  validateScopeManifest,
+} = require("../plugins/codex-gemini/scripts/json-schema.js");
 
 const bridgeScript = path.join(
   __dirname,
@@ -75,7 +80,33 @@ process.stdin.on("end", () => {
     }));
     return;
   }
-  process.stdout.write(mode === "invalid-json" ? "not-json" : '{"ok":true}');
+  const outputs = {
+    "invalid-json": "not-json",
+    "invalid-schema": '{"ok":"true"}',
+    "invalid-scope": JSON.stringify({
+      scope_id: "scope-1",
+      scope_compliance: {
+        mode: "CLOSED_BOOK",
+        used_tools: false,
+        used_external_search: false,
+        reviewed_files: ["backend/src/app.ts"],
+        out_of_scope_files: [],
+      },
+      findings: [{ file: "src/app.ts" }],
+    }),
+    "invalid-scope-text": JSON.stringify({
+      scope_id: "scope-1",
+      scope_compliance: {
+        mode: "CLOSED_BOOK",
+        used_tools: false,
+        used_external_search: false,
+        reviewed_files: ["backend/src/app.ts"],
+        out_of_scope_files: [],
+      },
+      findings: [{ file: "backend/src/app.ts", evidence: "See src/app.ts for the issue." }],
+    }),
+  };
+  process.stdout.write(outputs[mode] || '{"ok":true}');
 });
 `;
   fs.writeFileSync(path.join(bundleDir, "gemini.js"), script, "utf8");
@@ -106,6 +137,25 @@ function runBridgeWithFakeGemini(cwd, args, mode) {
       PATH: `${binDir}${path.delimiter}${process.env.PATH || ""}`,
     },
   });
+}
+
+function writeJson(root, name, value) {
+  fs.writeFileSync(path.join(root, name), JSON.stringify(value), "utf8");
+}
+
+function readJson(root, name) {
+  return JSON.parse(fs.readFileSync(path.join(root, name), "utf8"));
+}
+
+function runValidation(root, options, mode) {
+  return runBridgeWithFakeGemini(root, [
+    "--format", "json",
+    "--output-file", "review.raw.json",
+    "--metadata-file", "review.metadata.json",
+    "--validation-file", "review.validation.json",
+    ...options,
+    "Review.",
+  ], mode);
 }
 
 test("unknown CLI options fail instead of becoming task text", () => {
@@ -188,6 +238,74 @@ test("closed-book stderr hides only the known tool initialization warning", () =
   assert.deepEqual(result.suppressedWarnings, [
     "Ripgrep is not available. Falling back to GrepTool.",
   ]);
+});
+
+test("output validators enforce the review schema and exact scope", () => {
+  const schema = {
+    type: "object",
+    additionalProperties: false,
+    required: ["schema_version", "verdict", "findings"],
+    properties: {
+      schema_version: { const: "1.0" },
+      verdict: { enum: ["pass", "fix"] },
+      findings: {
+        type: "array",
+        items: { $ref: "#/$defs/finding" },
+      },
+    },
+    $defs: {
+      finding: {
+        type: "object",
+        additionalProperties: false,
+        required: ["file", "blocking"],
+        properties: {
+          file: { type: "string" },
+          blocking: { type: "boolean" },
+          confidence: { type: "number", minimum: 0, maximum: 1 },
+        },
+      },
+    },
+  };
+
+  assertSupportedJsonSchema(schema);
+  assert.deepEqual(validateJsonSchema({ schema_version: "1.0", verdict: "pass", findings: [] }, schema), []);
+  const errors = validateJsonSchema({
+    schema_version: 1,
+    verdict: "fail",
+    findings: [{ file: "src/a.js", confidence: 2, extra: true }],
+    unexpected: true,
+  }, schema);
+  assert.ok(errors.some((error) => error.path === "/schema_version" && error.keyword === "const"));
+  assert.ok(errors.some((error) => error.path === "/verdict" && error.keyword === "enum"));
+  assert.ok(errors.some((error) => error.path === "/findings/0/blocking" && error.keyword === "required"));
+  assert.ok(errors.some((error) => error.path === "/findings/0/confidence" && error.keyword === "maximum"));
+  assert.ok(errors.some((error) => error.path === "/findings/0/extra" && error.keyword === "additionalProperties"));
+  assert.ok(errors.some((error) => error.path === "/unexpected" && error.keyword === "additionalProperties"));
+  assert.throws(
+    () => assertSupportedJsonSchema({ type: "string", format: "email" }),
+    /Unsupported JSON Schema keyword.*format/,
+  );
+  const response = {
+    scope_id: "scope-1",
+    scope_compliance: {
+      mode: "CLOSED_BOOK",
+      used_tools: false,
+      used_external_search: false,
+      reviewed_files: ["backend/src/app.ts"],
+      out_of_scope_files: [],
+    },
+    findings: [{ file: "src/app.ts", evidence: "See prisma/schema.prisma." }],
+  };
+  const manifest = {
+    scope_id: "scope-1",
+    mode: "CLOSED_BOOK",
+    allowed_files: ["backend/src/app.ts"],
+  };
+  assert.deepEqual(validateScopeManifest(response, manifest).map((error) => error.path), ["/findings/0/file"]);
+  assert.deepEqual(
+    validateScopeManifest(response, manifest, { strictText: true }).map((error) => error.path),
+    ["/findings/0/file", "/findings/0/evidence"],
+  );
 });
 
 test("literal file selection does not scan an entire non-Git workspace", async () => {
@@ -283,7 +401,7 @@ test("--changed --plan works through the public CLI", () => {
     );
     assert.equal(result.status, 0, result.stderr || result.stdout || result.error?.message);
     const plan = JSON.parse(result.stdout);
-    assert.equal(plan.pluginVersion, "1.0.0-rc.2");
+    assert.equal(plan.pluginVersion, "1.0.0-rc.3");
     assert.ok(plan.gitReview.changedFiles.includes("app.js"));
     assert.ok(plan.includedFiles.some((file) => file.path === "app.js"));
     assert.ok(plan.prompt.estimatedTokens > 0);
@@ -326,7 +444,100 @@ test("public CLI streams valid JSON to the final output and writes metadata", ()
     assert.equal(fs.existsSync(path.join(tempDir, "review.json.partial")), false);
     const metadata = JSON.parse(fs.readFileSync(path.join(tempDir, "review.meta.json"), "utf8"));
     assert.equal(metadata.status, "success");
-    assert.equal(metadata.pluginVersion, "1.0.0-rc.2");
+    assert.equal(metadata.pluginVersion, "1.0.0-rc.3");
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("public CLI validates output and records completed-valid", () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-gemini-validation-success-"));
+  try {
+    writeJson(tempDir, "response.schema.json", {
+      type: "object",
+      additionalProperties: false,
+      required: ["ok"],
+      properties: { ok: { const: true } },
+    });
+    const result = runValidation(tempDir, ["--response-schema", "response.schema.json"], "valid-json");
+
+    assert.equal(result.status, 0, result.stderr || result.error?.message);
+    assert.equal(fs.readFileSync(path.join(tempDir, "review.raw.json"), "utf8"), '{"ok":true}');
+    const metadata = readJson(tempDir, "review.metadata.json");
+    assert.equal(metadata.status, "completed-valid");
+    assert.equal(metadata.processStatus, "success");
+    assert.equal(metadata.validationStatus, "valid");
+    assert.deepEqual(readJson(tempDir, "review.validation.json").errors, []);
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("output validation requires JSON format and explicit raw and validation files", () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-gemini-validation-options-"));
+  try {
+    writeJson(tempDir, "response.schema.json", { type: "object" });
+    const missingFormat = runBridgeWithFakeGemini(
+      tempDir,
+      ["--response-schema", "response.schema.json", "--output-file", "raw.json", "--validation-file", "validation.json", "Review."],
+      "valid-json",
+    );
+    assert.equal(missingFormat.status, 1);
+    assert.match(missingFormat.stderr, /require --format json/);
+
+    const missingFiles = runBridgeWithFakeGemini(
+      tempDir,
+      ["--format", "json", "--response-schema", "response.schema.json", "Review."],
+      "valid-json",
+    );
+    assert.equal(missingFiles.status, 1);
+    assert.match(missingFiles.stderr, /requires both --output-file and --validation-file/);
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("schema and JSON failures preserve raw output", () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-gemini-validation-schema-"));
+  try {
+    writeJson(tempDir, "response.schema.json", {
+      type: "object",
+      required: ["ok"],
+      properties: { ok: { type: "boolean" } },
+    });
+    for (const [mode, raw, keyword] of [
+      ["invalid-schema", '{"ok":"true"}', "type"],
+      ["invalid-json", "not-json", "parse"],
+    ]) {
+      const result = runValidation(tempDir, ["--response-schema", "response.schema.json"], mode);
+      assert.equal(result.status, 2, result.stderr || result.error?.message);
+      assert.equal(fs.readFileSync(path.join(tempDir, "review.raw.json"), "utf8"), raw);
+      assert.equal(fs.existsSync(path.join(tempDir, "review.raw.json.partial")), false);
+      assert.equal(readJson(tempDir, "review.metadata.json").status, "completed-invalid-schema");
+      assert.equal(readJson(tempDir, "review.validation.json").errors[0].keyword, keyword);
+    }
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("scope validation rejects shortened structured and free-text paths", () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-gemini-validation-scope-"));
+  try {
+    writeJson(tempDir, "scope.json", {
+      scope_id: "scope-1",
+      mode: "CLOSED_BOOK",
+      allowed_files: ["backend/src/app.ts"],
+    });
+    for (const [mode, extra, errorPath] of [
+      ["invalid-scope", [], "/findings/0/file"],
+      ["invalid-scope-text", ["--strict-scope-text"], "/findings/0/evidence"],
+    ]) {
+      const result = runValidation(tempDir, ["--scope-manifest", "scope.json", ...extra], mode);
+      assert.equal(result.status, 3, result.stderr || result.error?.message);
+      assert.equal(readJson(tempDir, "review.metadata.json").status, "completed-invalid-scope");
+      assert.ok(readJson(tempDir, "review.validation.json").errors.some((error) => error.path === errorPath));
+    }
   } finally {
     fs.rmSync(tempDir, { recursive: true, force: true });
   }
@@ -370,6 +581,8 @@ test("public CLI preserves invalid JSON as partial output", () => {
     assert.equal(fs.readFileSync(path.join(tempDir, "review.json.partial"), "utf8"), "not-json");
     const metadata = JSON.parse(fs.readFileSync(path.join(tempDir, "review.meta.json"), "utf8"));
     assert.equal(metadata.status, "invalid-json");
+    assert.equal(metadata.processStatus, "success");
+    assert.equal(metadata.validationStatus, "invalid");
   } finally {
     fs.rmSync(tempDir, { recursive: true, force: true });
   }
