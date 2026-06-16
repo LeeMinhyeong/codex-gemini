@@ -40,6 +40,7 @@ The bridge:
 - inlines text-like files into a structured prompt
 - serializes file contents and Git diffs as untrusted JSON data
 - invokes `gemini` in headless mode
+- requires an explicit `--model` for live Gemini calls
 - forwards cancellation signals and supervises the Gemini process tree
 - reports heartbeat progress for long-running requests
 - asks Gemini to cite file paths and call out partial context
@@ -50,7 +51,7 @@ The bridge:
 - `--files <glob,...>`: include files matching glob patterns
 - `--changed`: include staged, unstaged, and untracked changes
 - `--base <ref>`: include `<ref>...HEAD` and current working-tree changes
-- `--model <name>`: pass a Gemini model override only when requested
+- `--model <name>`: required Gemini model for live invocations
 - `--format <text|json|stream-json>`: choose Gemini output format
 - `--max-files <n>`: limit files inlined into the prompt
 - `--max-file-bytes <n>`: limit bytes per file
@@ -78,43 +79,44 @@ The bridge:
 Architecture review:
 
 ```powershell
-node <plugin-root>\scripts\gemini-bridge.js --dirs src,docs "Explain the architecture and cite the key files."
+node <plugin-root>\scripts\gemini-bridge.js --model <gemini-model> --dirs src,docs "Explain the architecture and cite the key files."
 ```
 
 Current-change review:
 
 ```powershell
 node <plugin-root>\scripts\gemini-bridge.js --changed --plan "Review the current changes."
-node <plugin-root>\scripts\gemini-bridge.js --changed --output-file _workspace/gemini-review.md "Review the current changes."
+node <plugin-root>\scripts\gemini-bridge.js --model <gemini-model> --changed --output-file _workspace/gemini-review.md "Review the current changes."
 ```
 
 Refactor impact:
 
 ```powershell
-node <plugin-root>\scripts\gemini-bridge.js --dirs src "Analyze the impact of refactoring the auth module. Include affected files and migration steps."
+node <plugin-root>\scripts\gemini-bridge.js --model <gemini-model> --dirs src "Analyze the impact of refactoring the auth module. Include affected files and migration steps."
 ```
 
 Security review:
 
 ```powershell
-node <plugin-root>\scripts\gemini-bridge.js --files "src/**/*.ts,src/**/*.tsx" --timeout-ms 300000 --output-file _workspace/gemini-security-review.md "Review auth and input handling. Output file:line, risk, and recommended fix."
+node <plugin-root>\scripts\gemini-bridge.js --model <gemini-model> --files "src/**/*.ts,src/**/*.tsx" --timeout-ms 300000 --output-file _workspace/gemini-security-review.md "Review auth and input handling. Output file:line, risk, and recommended fix."
 ```
 
 Closed-book review:
 
 ```powershell
-node <plugin-root>\scripts\gemini-bridge.js --closed-book --format json --files "review-request.json,src/auth.ts" --response-schema "review-response.schema.json" --scope-manifest "review-request.json" --strict-scope-text --output-file _workspace/gemini-review.raw.json --validation-file _workspace/gemini-review.validation.json --metadata-file _workspace/gemini-review.metadata.json "Use only the serialized records and return the requested JSON object."
+node <plugin-root>\scripts\gemini-bridge.js --model <gemini-model> --closed-book --format json --files "review-request.json,src/auth.ts" --response-schema "review-response.schema.json" --scope-manifest "review-request.json" --strict-scope-text --output-file _workspace/gemini-review.raw.json --validation-file _workspace/gemini-review.validation.json --metadata-file _workspace/gemini-review.metadata.json "Use only the serialized records and return the requested JSON object."
 ```
 
 Structured data:
 
 ```powershell
-node <plugin-root>\scripts\gemini-bridge.js --files "schemas/**/*.json,data/**/*.csv" "Summarize the contracts and identify breaking changes."
+node <plugin-root>\scripts\gemini-bridge.js --model <gemini-model> --files "schemas/**/*.json,data/**/*.csv" "Summarize the contracts and identify breaking changes."
 ```
 
 ## Practical Rules
 
 - Narrow the context deliberately with `--dirs` or `--files`.
+- Always pass `--model` for live Gemini calls. The bridge intentionally refuses Gemini CLI default routing.
 - Prefer `--changed` for implementation reviews and `--base <ref>` for branch or pull-request reviews.
 - Use `--plan` before sending broad or sensitive context.
 - Respect `.gitignore`; add `.codex-geminiignore` for plugin-specific exclusions.
@@ -126,7 +128,10 @@ node <plugin-root>\scripts\gemini-bridge.js --files "schemas/**/*.json,data/**/*
 - Use `--metadata-file` when another workflow needs a deterministic handoff record.
 - Use `--closed-book` whenever the selected files are an exhaustive evidence allowlist. This mode denies all tools, disables extensions and MCP access, and isolates Gemini from the original workspace.
 - For contract-bound JSON, use `--response-schema`, `--scope-manifest`, and `--validation-file`. Treat only `completed-valid` with exit code 0 as promotable output.
-- Validation preserves raw Gemini output unchanged. Do not auto-correct enum values, required fields, or file paths.
+- Validation preserves raw Gemini output unchanged. If Gemini CLI returns a JSON wrapper, validate the parsed string in `response` while keeping the wrapper as the raw artifact.
+- Use metadata `resolvedModels` and thoughts-token counts as observed routing data only; the bridge does not expose a thinking-level control.
+- Treat `failed-provider-capacity` and `failed-provider-rate-limit` as provider conditions, not review results.
+- Do not auto-correct enum values, required fields, or file paths.
 - If a timeout happens, reduce `--max-files` or `--max-file-bytes`, split by module, or raise `--timeout-ms`.
 - Do not send secrets, private credentials, or unrelated user data to Gemini.
 - Ask for a concrete output format when using Gemini for review.

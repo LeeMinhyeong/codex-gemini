@@ -65,6 +65,11 @@ process.stdin.on("end", () => {
     setInterval(() => {}, 1000);
     return;
   }
+  if (mode === "provider-capacity-timeout") {
+    process.stderr.write("429 Too Many Requests\\nNo capacity available for model gemini-3.1-flash-lite on the server\\n");
+    setInterval(() => {}, 1000);
+    return;
+  }
   if (mode === "doctor") {
     process.stdout.write("CODEX_GEMINI_DOCTOR_OK");
     return;
@@ -83,6 +88,49 @@ process.stdin.on("end", () => {
   const outputs = {
     "invalid-json": "not-json",
     "invalid-schema": '{"ok":"true"}',
+    "direct-stats-json": JSON.stringify({ ok: true, stats: { note: "model output" } }),
+    "wrapped-valid": JSON.stringify({
+      session_id: "session-1",
+      response: JSON.stringify({ ok: true }),
+      stats: {
+        models: {
+          "gemini-3.1-flash-lite": {
+            roles: {
+              utility_router: {
+                totalRequests: 1,
+                totalErrors: 0,
+                totalLatencyMs: 10,
+                tokens: { thoughts: 3 },
+              },
+            },
+          },
+          "gemini-3-flash-preview": {
+            roles: {
+              main: {
+                totalRequests: 1,
+                totalErrors: 0,
+                totalLatencyMs: 20,
+                tokens: { thoughts: 7 },
+              },
+            },
+          },
+        },
+      },
+    }),
+    "wrapped-invalid-response-json": JSON.stringify({
+      session_id: "session-1",
+      response: "not-json",
+      stats: {},
+    }),
+    "wrapped-missing-response": JSON.stringify({
+      session_id: "session-1",
+      stats: {},
+    }),
+    "wrapped-non-string-response": JSON.stringify({
+      session_id: "session-1",
+      response: { ok: true },
+      stats: {},
+    }),
     "invalid-scope": JSON.stringify({
       scope_id: "scope-1",
       scope_compliance: {
@@ -124,9 +172,12 @@ process.stdin.on("end", () => {
   return binDir;
 }
 
-function runBridgeWithFakeGemini(cwd, args, mode) {
+function runBridgeWithFakeGemini(cwd, args, mode, { addModel = true } = {}) {
   const binDir = createFakeGeminiBin(cwd);
-  return spawnSync(process.execPath, [bridgeScript, ...args], {
+  const finalArgs = addModel && !args.includes("--model") && !args.includes("--help") && !args.includes("--version")
+    ? ["--model", "gemini-test-model", ...args]
+    : args;
+  return spawnSync(process.execPath, [bridgeScript, ...finalArgs], {
     cwd,
     encoding: "utf8",
     timeout: 10000,
@@ -178,6 +229,31 @@ test("--closed-book selects isolated no-tool execution", () => {
   assert.ok(args.includes("--extensions"));
   assert.ok(args.includes("none"));
   assert.ok(args.includes("--allowed-mcp-server-names"));
+});
+
+test("live invocations require an explicit model", () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-gemini-model-required-"));
+  try {
+    fs.writeFileSync(path.join(tempDir, "a.txt"), "review me", "utf8");
+    const result = runBridgeWithFakeGemini(
+      tempDir,
+      ["--files", "a.txt", "Review."],
+      "valid-json",
+      { addModel: false },
+    );
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /--model is required for live Gemini invocations/);
+
+    const plan = runBridgeWithFakeGemini(
+      tempDir,
+      ["--files", "a.txt", "--plan", "Review."],
+      "valid-json",
+      { addModel: false },
+    );
+    assert.equal(plan.status, 0, plan.stderr || plan.stdout);
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
 });
 
 test("prompt treats file contents as serialized untrusted data", () => {
@@ -259,9 +335,11 @@ test("output validators enforce the review schema and exact scope", () => {
         additionalProperties: false,
         required: ["file", "blocking"],
         properties: {
-          file: { type: "string" },
+          file: { type: "string", pattern: "^backend/" },
           blocking: { type: "boolean" },
           confidence: { type: "number", minimum: 0, maximum: 1 },
+          tags: { type: "array", uniqueItems: true },
+          evidence: { type: "string", minLength: 5 },
         },
       },
     },
@@ -272,13 +350,16 @@ test("output validators enforce the review schema and exact scope", () => {
   const errors = validateJsonSchema({
     schema_version: 1,
     verdict: "fail",
-    findings: [{ file: "src/a.js", confidence: 2, extra: true }],
+    findings: [{ file: "src/a.js", confidence: 2, tags: ["a", "a"], evidence: "bad", extra: true }],
     unexpected: true,
   }, schema);
   assert.ok(errors.some((error) => error.path === "/schema_version" && error.keyword === "const"));
   assert.ok(errors.some((error) => error.path === "/verdict" && error.keyword === "enum"));
   assert.ok(errors.some((error) => error.path === "/findings/0/blocking" && error.keyword === "required"));
   assert.ok(errors.some((error) => error.path === "/findings/0/confidence" && error.keyword === "maximum"));
+  assert.ok(errors.some((error) => error.path === "/findings/0/file" && error.keyword === "pattern"));
+  assert.ok(errors.some((error) => error.path === "/findings/0/tags" && error.keyword === "uniqueItems"));
+  assert.ok(errors.some((error) => error.path === "/findings/0/evidence" && error.keyword === "minLength"));
   assert.ok(errors.some((error) => error.path === "/findings/0/extra" && error.keyword === "additionalProperties"));
   assert.ok(errors.some((error) => error.path === "/unexpected" && error.keyword === "additionalProperties"));
   assert.throws(
@@ -401,7 +482,7 @@ test("--changed --plan works through the public CLI", () => {
     );
     assert.equal(result.status, 0, result.stderr || result.stdout || result.error?.message);
     const plan = JSON.parse(result.stdout);
-    assert.equal(plan.pluginVersion, "1.0.0-rc.3");
+    assert.equal(plan.pluginVersion, "1.0.0-rc.4");
     assert.ok(plan.gitReview.changedFiles.includes("app.js"));
     assert.ok(plan.includedFiles.some((file) => file.path === "app.js"));
     assert.ok(plan.prompt.estimatedTokens > 0);
@@ -444,7 +525,7 @@ test("public CLI streams valid JSON to the final output and writes metadata", ()
     assert.equal(fs.existsSync(path.join(tempDir, "review.json.partial")), false);
     const metadata = JSON.parse(fs.readFileSync(path.join(tempDir, "review.meta.json"), "utf8"));
     assert.equal(metadata.status, "success");
-    assert.equal(metadata.pluginVersion, "1.0.0-rc.3");
+    assert.equal(metadata.pluginVersion, "1.0.0-rc.4");
   } finally {
     fs.rmSync(tempDir, { recursive: true, force: true });
   }
@@ -468,6 +549,60 @@ test("public CLI validates output and records completed-valid", () => {
     assert.equal(metadata.processStatus, "success");
     assert.equal(metadata.validationStatus, "valid");
     assert.deepEqual(readJson(tempDir, "review.validation.json").errors, []);
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("public CLI unwraps Gemini JSON response before validation", () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-gemini-validation-wrapper-"));
+  try {
+    writeJson(tempDir, "response.schema.json", {
+      type: "object",
+      additionalProperties: false,
+      required: ["ok"],
+      properties: { ok: { const: true } },
+    });
+    const result = runValidation(tempDir, ["--response-schema", "response.schema.json"], "wrapped-valid");
+
+    assert.equal(result.status, 0, result.stderr || result.error?.message);
+    const raw = readJson(tempDir, "review.raw.json");
+    assert.equal(typeof raw.response, "string");
+    const metadata = readJson(tempDir, "review.metadata.json");
+    assert.equal(metadata.status, "completed-valid");
+    assert.equal(metadata.rawStdoutFormat, "gemini-cli-json-wrapper");
+    assert.equal(metadata.validatedPayload, "response");
+    assert.deepEqual(metadata.resolvedModels.map((model) => [model.name, model.role, model.thoughtsTokens]), [
+      ["gemini-3.1-flash-lite", "utility_router", 3],
+      ["gemini-3-flash-preview", "main", 7],
+    ]);
+    const validation = readJson(tempDir, "review.validation.json");
+    assert.equal(validation.rawStdoutFormat, "gemini-cli-json-wrapper");
+    assert.equal(validation.validatedPayload, "response");
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("public CLI does not treat ordinary stats fields as Gemini wrappers", () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-gemini-validation-direct-stats-"));
+  try {
+    writeJson(tempDir, "response.schema.json", {
+      type: "object",
+      additionalProperties: false,
+      required: ["ok", "stats"],
+      properties: {
+        ok: { const: true },
+        stats: { type: "object" },
+      },
+    });
+    const result = runValidation(tempDir, ["--response-schema", "response.schema.json"], "direct-stats-json");
+
+    assert.equal(result.status, 0, result.stderr || result.error?.message);
+    const metadata = readJson(tempDir, "review.metadata.json");
+    assert.equal(metadata.status, "completed-valid");
+    assert.equal(metadata.rawStdoutFormat, "direct-json");
+    assert.equal(metadata.validatedPayload, "stdout");
   } finally {
     fs.rmSync(tempDir, { recursive: true, force: true });
   }
@@ -508,12 +643,18 @@ test("schema and JSON failures preserve raw output", () => {
     for (const [mode, raw, keyword] of [
       ["invalid-schema", '{"ok":"true"}', "type"],
       ["invalid-json", "not-json", "parse"],
+      ["wrapped-invalid-response-json", JSON.stringify({ session_id: "session-1", response: "not-json", stats: {} }), "parse"],
+      ["wrapped-missing-response", JSON.stringify({ session_id: "session-1", stats: {} }), "required"],
+      ["wrapped-non-string-response", JSON.stringify({ session_id: "session-1", response: { ok: true }, stats: {} }), "type"],
     ]) {
       const result = runValidation(tempDir, ["--response-schema", "response.schema.json"], mode);
       assert.equal(result.status, 2, result.stderr || result.error?.message);
       assert.equal(fs.readFileSync(path.join(tempDir, "review.raw.json"), "utf8"), raw);
       assert.equal(fs.existsSync(path.join(tempDir, "review.raw.json.partial")), false);
-      assert.equal(readJson(tempDir, "review.metadata.json").status, "completed-invalid-schema");
+      const expectedStatus = mode.startsWith("wrapped-")
+        ? "completed-invalid-response-json"
+        : "completed-invalid-schema";
+      assert.equal(readJson(tempDir, "review.metadata.json").status, expectedStatus);
       assert.equal(readJson(tempDir, "review.validation.json").errors[0].keyword, keyword);
     }
   } finally {
@@ -632,6 +773,31 @@ test("timeout metadata distinguishes detected tool activity", () => {
     const metadata = JSON.parse(fs.readFileSync(path.join(tempDir, "review.meta.json"), "utf8"));
     assert.equal(metadata.status, "timeout-with-tool-use");
     assert.equal(metadata.toolUseDetected, true);
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("provider capacity failures are reported separately from timeouts", () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-gemini-provider-capacity-"));
+  try {
+    const result = runBridgeWithFakeGemini(
+      tempDir,
+      [
+        "--timeout-ms", "100",
+        "--heartbeat-ms", "0",
+        "--metadata-file", "review.meta.json",
+        "Review.",
+      ],
+      "provider-capacity-timeout",
+    );
+    assert.equal(result.status, 1, result.stderr || result.error?.message);
+    const metadata = JSON.parse(fs.readFileSync(path.join(tempDir, "review.meta.json"), "utf8"));
+    assert.equal(metadata.status, "failed-provider-capacity");
+    assert.equal(metadata.processStatus, "failed");
+    assert.equal(metadata.providerStatus, 429);
+    assert.equal(metadata.providerReason, "capacity");
+    assert.match(metadata.providerMessage, /No capacity available/);
   } finally {
     fs.rmSync(tempDir, { recursive: true, force: true });
   }

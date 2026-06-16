@@ -1,6 +1,6 @@
 {
   "name": "codex-gemini",
-  "version": "1.0.0-rc.3",
+  "version": "1.0.0-rc.4",
   "description": "Use Gemini CLI from Codex for broad codebase analysis, review, and synthesis tasks.",
   "author": {
     "name": "LeeMinhyeong"

@@ -10,7 +10,7 @@ const {
   validateScopeManifest,
 } = require("./json-schema.js");
 
-const PLUGIN_VERSION = "1.0.0-rc.3";
+const PLUGIN_VERSION = "1.0.0-rc.4";
 const DEFAULT_MAX_FILES = 40;
 const DEFAULT_MAX_FILE_BYTES = 32768;
 const DEFAULT_MAX_DIFF_BYTES = 262144;
@@ -146,7 +146,7 @@ const USAGE = `Usage: node scripts/gemini-bridge.js [options] <task>
 
 Options:
   --task <text>            Explicit task text.
-  --model <name>           Gemini model override.
+  --model <name>           Required Gemini model for live invocations.
   --dirs <path,...>        Directories to ingest recursively.
   --files <glob,...>       File globs to ingest.
   --changed                Review staged, unstaged, and untracked changes.
@@ -1196,6 +1196,140 @@ function validationReport(status, details, errors = []) {
   };
 }
 
+function validationError(pathName, keyword, expected, actual, message) {
+  return {
+    path: pathName || "/",
+    keyword,
+    expected,
+    actual,
+    message,
+  };
+}
+
+function isGeminiCliJsonWrapper(value) {
+  return Boolean(
+    value
+      && typeof value === "object"
+      && !Array.isArray(value)
+      && ("response" in value || ("session_id" in value && "stats" in value)),
+  );
+}
+
+function extractResolvedModels(stats) {
+  const models = stats?.models;
+  if (!models || typeof models !== "object" || Array.isArray(models)) {
+    return [];
+  }
+  const resolved = [];
+  for (const [name, modelStats] of Object.entries(models)) {
+    const roles = modelStats?.roles && typeof modelStats.roles === "object"
+      ? Object.entries(modelStats.roles)
+      : [];
+    if (roles.length === 0) {
+      resolved.push({
+        name,
+        role: null,
+        totalRequests: modelStats?.api?.totalRequests ?? null,
+        totalErrors: modelStats?.api?.totalErrors ?? null,
+        totalLatencyMs: modelStats?.api?.totalLatencyMs ?? null,
+        thoughtsTokens: modelStats?.tokens?.thoughts ?? null,
+      });
+      continue;
+    }
+    for (const [role, roleStats] of roles) {
+      resolved.push({
+        name,
+        role,
+        totalRequests: roleStats?.totalRequests ?? null,
+        totalErrors: roleStats?.totalErrors ?? null,
+        totalLatencyMs: roleStats?.totalLatencyMs ?? null,
+        thoughtsTokens: roleStats?.tokens?.thoughts ?? modelStats?.tokens?.thoughts ?? null,
+      });
+    }
+  }
+  return resolved;
+}
+
+function selectValidationPayload(parsedOutput) {
+  if (!isGeminiCliJsonWrapper(parsedOutput)) {
+    return {
+      payload: parsedOutput,
+      details: {
+        rawStdoutFormat: "direct-json",
+        validatedPayload: "stdout",
+        resolvedModels: [],
+      },
+      errors: [],
+    };
+  }
+
+  const details = {
+    rawStdoutFormat: "gemini-cli-json-wrapper",
+    validatedPayload: "response",
+    resolvedModels: extractResolvedModels(parsedOutput.stats),
+  };
+  if (!Object.prototype.hasOwnProperty.call(parsedOutput, "response")) {
+    return {
+      payload: undefined,
+      details,
+      errors: [validationError("/response", "required", true, false, "Gemini CLI JSON wrapper is missing response.")],
+    };
+  }
+  if (typeof parsedOutput.response !== "string") {
+    return {
+      payload: undefined,
+      details,
+      errors: [validationError("/response", "type", "string", typeof parsedOutput.response, "Gemini CLI JSON wrapper response must be a JSON string.")],
+    };
+  }
+  try {
+    return {
+      payload: JSON.parse(parsedOutput.response),
+      details,
+      errors: [],
+    };
+  } catch (error) {
+    return {
+      payload: undefined,
+      details,
+      errors: [validationError("/response", "parse", "valid JSON string", "invalid JSON string", error.message)],
+    };
+  }
+}
+
+function detectProviderFailure(text) {
+  if (!text) return undefined;
+  const hasRateLimit = /\b429\b|Too Many Requests|rateLimitExceeded/i.test(text);
+  const hasCapacity = /No capacity available|capacity/i.test(text);
+  if (!hasRateLimit && !hasCapacity) return undefined;
+  const messagePattern = hasCapacity
+    ? /No capacity available|capacity/i
+    : /\b429\b|Too Many Requests|rateLimitExceeded/i;
+  const line = text.split(/\r?\n/)
+    .find((entry) => messagePattern.test(entry))
+    ?.trim();
+  return {
+    status: hasCapacity ? "failed-provider-capacity" : "failed-provider-rate-limit",
+    providerStatus: hasRateLimit ? 429 : null,
+    providerReason: /rateLimitExceeded/i.test(text)
+      ? "rateLimitExceeded"
+      : hasCapacity ? "capacity" : "rate-limit",
+    providerMessage: line || "Gemini provider reported a capacity or rate-limit failure.",
+  };
+}
+
+function detectToolUse(text, source = "stderr") {
+  const match = text?.match(/Ripgrep|GrepTool|grep_search|read_file|run_shell_command|web_fetch/i);
+  if (!match) {
+    return { toolUseDetected: false };
+  }
+  return {
+    toolUseDetected: true,
+    toolUseDetectionSource: source,
+    toolUseDetectionEvidence: match[0],
+  };
+}
+
 function writeMetadata(metadataFilePath, metadata) {
   if (!metadataFilePath) {
     return;
@@ -1656,6 +1790,9 @@ async function run(argv) {
     return 0;
   }
   if (parsed.doctor) {
+    if (!parsed.model) {
+      throw new Error("--model is required for live Gemini invocations. Refusing to use Gemini CLI default routing.");
+    }
     return runDoctor(parsed);
   }
 
@@ -1742,6 +1879,10 @@ async function run(argv) {
     return 0;
   }
 
+  if (!parsed.printCommand && !parsed.model) {
+    throw new Error("--model is required for live Gemini invocations. Refusing to use Gemini CLI default routing.");
+  }
+
   const geminiInvocation = resolveGeminiInvocation();
 
   if (parsed.printCommand) {
@@ -1791,6 +1932,10 @@ async function run(argv) {
     executionMode: parsed.closedBook ? "closed-book" : "workspace",
     geminiWorkspace: parsed.closedBook ? "isolated-temporary-directory" : ".",
     model: parsed.model || null,
+    requestedModel: parsed.model || null,
+    modelSource: parsed.model ? "cli-required" : null,
+    defaultRoutingAllowed: false,
+    resolvedModels: [],
     format: parsed.format,
     responseSchema: responseSchemaPath ? relativeToCwd(cwd, responseSchemaPath) : null,
     scopeManifest: scopeManifestPath ? relativeToCwd(cwd, scopeManifestPath) : null,
@@ -1899,8 +2044,20 @@ async function run(argv) {
     if (partialPath) {
       process.stderr.write(`[gemini-bridge] Partial output preserved at ${relativeToCwd(cwd, partialPath)}\n`);
     }
-    const toolUseDetected = /Ripgrep|GrepTool|grep_search|read_file|run_shell_command|web_fetch/i.test(result.stderr);
-    const timeoutStatus = toolUseDetected
+    const providerFailure = detectProviderFailure(`${result.stderr}\n${result.stdoutTail || ""}`);
+    if (providerFailure) {
+      return finish(providerFailure.status, 1, {
+        processStatus: "failed",
+        validationStatus: "skipped",
+        ...providerFailure,
+        firstStdoutAt: result.firstStdoutAt,
+        lastStdoutAt: result.lastStdoutAt,
+        suppressedInitializationWarnings: stderrDiagnostics.suppressedWarnings,
+        partialOutputFile: partialPath ? relativeToCwd(cwd, partialPath) : null,
+      });
+    }
+    const toolUse = detectToolUse(result.stderr, "stderr");
+    const timeoutStatus = toolUse.toolUseDetected
       ? "timeout-with-tool-use"
       : result.stdoutBytes > 0
         ? "timeout-after-output"
@@ -1908,7 +2065,7 @@ async function run(argv) {
     return finish(timeoutStatus, 124, {
       firstStdoutAt: result.firstStdoutAt,
       lastStdoutAt: result.lastStdoutAt,
-      toolUseDetected,
+      ...toolUse,
       suppressedInitializationWarnings: stderrDiagnostics.suppressedWarnings,
       partialOutputFile: partialPath ? relativeToCwd(cwd, partialPath) : null,
     });
@@ -1941,6 +2098,16 @@ async function run(argv) {
     process.stderr.write(
       `[gemini-bridge] Gemini exited with status ${result.status}. Prompt size: ${formatBytes(promptBytes)} (${promptBytes} bytes).\n`,
     );
+    const providerFailure = detectProviderFailure(`${result.stderr}\n${result.stdoutTail || ""}`);
+    if (providerFailure) {
+      return finish(providerFailure.status, result.status || 1, {
+        processStatus: "failed",
+        validationStatus: "skipped",
+        ...providerFailure,
+        suppressedInitializationWarnings: stderrDiagnostics.suppressedWarnings,
+        partialOutputFile: partialPath ? relativeToCwd(cwd, partialPath) : null,
+      });
+    }
     return finish("gemini-error", result.status || 1, {
       suppressedInitializationWarnings: stderrDiagnostics.suppressedWarnings,
       partialOutputFile: partialPath ? relativeToCwd(cwd, partialPath) : null,
@@ -1949,7 +2116,7 @@ async function run(argv) {
 
   const outputText = outputSession ? outputSession.readText() : result.stdout;
   const rawOutputFile = outputFilePath ? relativeToCwd(cwd, outputFilePath) : null;
-  const validationDetails = {
+  let validationDetails = {
     outputFile: rawOutputFile,
     responseSchema: responseSchemaPath ? relativeToCwd(cwd, responseSchemaPath) : null,
     scopeManifest: scopeManifestPath ? relativeToCwd(cwd, scopeManifestPath) : null,
@@ -1997,12 +2164,25 @@ async function run(argv) {
         partialOutputFile: partialPath ? relativeToCwd(cwd, partialPath) : null,
       });
     }
+    const outputDetails = selectValidationPayload(parsedOutput).details;
+    metadataBase.rawStdoutFormat = outputDetails.rawStdoutFormat;
+    metadataBase.resolvedModels = outputDetails.resolvedModels;
   }
 
   if (outputValidationEnabled) {
+    const selected = selectValidationPayload(parsedOutput);
+    validationDetails = { ...validationDetails, ...selected.details };
+    metadataBase.rawStdoutFormat = selected.details.rawStdoutFormat;
+    metadataBase.validatedPayload = selected.details.validatedPayload;
+    metadataBase.resolvedModels = selected.details.resolvedModels;
+    if (selected.errors.length > 0) {
+      process.stderr.write(`[gemini-bridge] Gemini response payload is not valid JSON for validation.\n`);
+      return finishValidation("completed-invalid-response-json", 2, selected.errors);
+    }
+    const validationPayload = selected.payload;
     const schemaErrors = responseSchema === undefined
       ? []
-      : validateJsonSchema(parsedOutput, responseSchema);
+      : validateJsonSchema(validationPayload, responseSchema);
     if (schemaErrors.length > 0) {
       process.stderr.write(`[gemini-bridge] Output failed JSON Schema validation with ${schemaErrors.length} error(s).\n`);
       return finishValidation("completed-invalid-schema", 2, schemaErrors);
@@ -2010,7 +2190,7 @@ async function run(argv) {
 
     const scopeErrors = scopeManifest === undefined
       ? []
-      : validateScopeManifest(parsedOutput, scopeManifest, { strictText: parsed.strictScopeText });
+      : validateScopeManifest(validationPayload, scopeManifest, { strictText: parsed.strictScopeText });
     if (scopeErrors.length > 0) {
       process.stderr.write(`[gemini-bridge] Output failed scope validation with ${scopeErrors.length} error(s).\n`);
       return finishValidation("completed-invalid-scope", 3, scopeErrors);

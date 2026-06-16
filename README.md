@@ -2,7 +2,7 @@
 
 Codex Gemini is a Codex plugin that delegates broad codebase analysis and review tasks to the local Gemini CLI.
 
-`1.0.0-rc.3` adds deterministic JSON Schema and closed-scope output validation while preserving Gemini's raw output.
+`1.0.0-rc.4` requires explicit model selection for live Gemini calls, validates Gemini CLI JSON wrapper responses, and reports provider capacity/rate-limit failures separately from timeouts.
 
 Use it when a task benefits from a large-context pass over many files, such as architecture review, refactor impact analysis, security review, documentation synthesis, or structured data analysis.
 
@@ -50,25 +50,26 @@ Review this codebase architecture and cite the important files.
 You can also run the bridge script directly from a repository:
 
 ```powershell
-node plugins/codex-gemini/scripts/gemini-bridge.js --dirs src,docs "Explain the architecture and cite key files."
+node plugins/codex-gemini/scripts/gemini-bridge.js --model <gemini-model> --dirs src,docs "Explain the architecture and cite key files."
 ```
 
 Review selected files:
 
 ```powershell
-node plugins/codex-gemini/scripts/gemini-bridge.js --files "src/**/*.ts,src/**/*.tsx" "Review auth and input handling. Return file, risk, and fix."
+node plugins/codex-gemini/scripts/gemini-bridge.js --model <gemini-model> --files "src/**/*.ts,src/**/*.tsx" "Review auth and input handling. Return file, risk, and fix."
 ```
 
 Run a closed-book review with no Gemini tools, extensions, MCP servers, or original workspace access:
 
 ```powershell
-node plugins/codex-gemini/scripts/gemini-bridge.js --closed-book --files "review-request.json,src/auth.ts" "Use only the serialized records and return the requested review JSON."
+node plugins/codex-gemini/scripts/gemini-bridge.js --model <gemini-model> --closed-book --files "review-request.json,src/auth.ts" "Use only the serialized records and return the requested review JSON."
 ```
 
 Validate a closed-book review before treating it as complete:
 
 ```powershell
 node plugins/codex-gemini/scripts/gemini-bridge.js `
+  --model <gemini-model> `
   --closed-book `
   --format json `
   --files "review-request.json,src/auth.ts" `
@@ -84,19 +85,19 @@ node plugins/codex-gemini/scripts/gemini-bridge.js `
 Review staged, unstaged, and untracked changes:
 
 ```powershell
-node plugins/codex-gemini/scripts/gemini-bridge.js --changed "Review the current changes for correctness."
+node plugins/codex-gemini/scripts/gemini-bridge.js --model <gemini-model> --changed "Review the current changes for correctness."
 ```
 
 Review changes from a base branch plus the current working tree:
 
 ```powershell
-node plugins/codex-gemini/scripts/gemini-bridge.js --base main "Review this branch as a pull request."
+node plugins/codex-gemini/scripts/gemini-bridge.js --model <gemini-model> --base main "Review this branch as a pull request."
 ```
 
 Run a larger review with an explicit timeout and saved output:
 
 ```powershell
-node plugins/codex-gemini/scripts/gemini-bridge.js --dirs src --timeout-ms 300000 --output-file _workspace/gemini-review.md "Review the implementation and cite files."
+node plugins/codex-gemini/scripts/gemini-bridge.js --model <gemini-model> --dirs src --timeout-ms 300000 --output-file _workspace/gemini-review.md "Review the implementation and cite files."
 ```
 
 Inspect the resolved Gemini command without running it:
@@ -117,7 +118,7 @@ node plugins/codex-gemini/scripts/gemini-bridge.js --changed --plan "Review the 
 - `--files <glob,...>`: include files matching glob patterns
 - `--changed`: include staged, unstaged, and untracked changes
 - `--base <ref>`: include committed changes from `<ref>...HEAD` and current working-tree changes
-- `--model <name>`: pass a Gemini model override
+- `--model <name>`: required Gemini model for live invocations
 - `--format <text|json|stream-json>`: choose Gemini output format
 - `--max-files <n>`: limit files inlined into the prompt
 - `--max-file-bytes <n>`: limit bytes per file
@@ -160,13 +161,17 @@ Add a workspace-root `.codex-geminiignore` for plugin-specific exclusions. It su
 - Output validation requires `--format json`, `--output-file`, and `--validation-file`.
 - The raw Gemini output is preserved unchanged at `--output-file`, including validation failures.
 - Validation metadata separates `processStatus` from `validationStatus` and reports `completed-valid`, `completed-invalid-schema`, or `completed-invalid-scope`.
-- Schema failures exit with code 2; scope failures exit with code 3.
+- When Gemini CLI returns a JSON wrapper with a string `response` field, validation preserves the wrapper as the raw output and validates the parsed `response` JSON.
+- Invalid wrapper `response` JSON reports `completed-invalid-response-json`.
+- Schema failures and wrapper response JSON failures exit with code 2; scope failures exit with code 3.
 - Scope validation checks reviewed files, out-of-scope files, and each finding's `file` field. `--strict-scope-text` additionally scans finding evidence, issue, recommendation, missing context, and residual risks for path-like references.
 - Supported JSON Schema keywords are checked explicitly. Unsupported keywords fail before Gemini is called rather than being silently ignored.
 - Closed-book runs record `executionMode: "closed-book"`, use a deny-all Gemini policy, disable extensions and MCP access, and remove the temporary workspace after exit.
-- Timeout metadata distinguishes no output, partial output, and detected tool activity.
+- Metadata records requested model details and, when present in Gemini CLI stats, resolved model roles and thoughts-token counts.
+- Provider capacity or rate-limit failures report `failed-provider-capacity` or `failed-provider-rate-limit` instead of being folded into timeout statuses.
+- Timeout metadata distinguishes no output, partial output, and detected tool activity, including the detection source and evidence.
 
-The dependency-free validator intentionally supports a review-contract subset of JSON Schema: local `$ref`, `$defs`/`definitions`, `type`, `const`, `enum`, object properties and required keys, additional properties, array items and size limits, and numeric ranges. Schema annotations such as title and description are accepted but do not affect validation.
+The dependency-free validator intentionally supports a review-contract subset of JSON Schema: local `$ref`, `$defs`/`definitions`, `type`, `const`, `enum`, object properties and required keys, additional properties, array items and size limits, unique array items, string `minLength` and `pattern`, and numeric ranges. Schema annotations such as title and description are accepted but do not affect validation.
 
 ## Privacy and Data
 
@@ -208,13 +213,13 @@ gemini auth
 Run the built-in health check. This sends a small live request to verify authentication:
 
 ```powershell
-node plugins/codex-gemini/scripts/gemini-bridge.js --doctor
+node plugins/codex-gemini/scripts/gemini-bridge.js --model <gemini-model> --doctor
 ```
 
 If a large review times out, rerun it with a smaller scope or a longer explicit timeout:
 
 ```powershell
-node plugins/codex-gemini/scripts/gemini-bridge.js --dirs backend/src --max-files 12 --max-file-bytes 8000 --timeout-ms 300000 "Review this area."
+node plugins/codex-gemini/scripts/gemini-bridge.js --model <gemini-model> --dirs backend/src --max-files 12 --max-file-bytes 8000 --timeout-ms 300000 "Review this area."
 ```
 
 The bridge reports the prompt size on timeout. Use that to split the task into smaller review passes when needed.

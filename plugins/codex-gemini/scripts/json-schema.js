@@ -3,7 +3,7 @@ const { isDeepStrictEqual } = require("node:util");
 const KEYWORDS = new Set([
   "$schema", "$id", "$defs", "definitions", "$ref", "title", "description", "default", "examples",
   "type", "const", "enum", "properties", "required", "additionalProperties", "items",
-  "minimum", "maximum", "minItems", "maxItems",
+  "minimum", "maximum", "minItems", "maxItems", "minLength", "pattern", "uniqueItems",
 ]);
 const TYPES = new Set(["null", "boolean", "object", "array", "number", "integer", "string"]);
 
@@ -65,6 +65,20 @@ function assertSupportedJsonSchema(schema) {
         throw new Error(`${keyword} at ${path} must be a non-negative integer.`);
       }
     }
+    if (node.minLength !== undefined && (!Number.isInteger(node.minLength) || node.minLength < 0)) {
+      throw new Error(`minLength at ${path} must be a non-negative integer.`);
+    }
+    if (node.pattern !== undefined) {
+      if (typeof node.pattern !== "string") throw new Error(`pattern at ${path} must be a string.`);
+      try {
+        new RegExp(node.pattern);
+      } catch (error) {
+        throw new Error(`pattern at ${path} is invalid: ${error.message}`);
+      }
+    }
+    if (node.uniqueItems !== undefined && typeof node.uniqueItems !== "boolean") {
+      throw new Error(`uniqueItems at ${path} must be boolean.`);
+    }
     for (const container of ["properties", "$defs", "definitions"]) {
       if (node[container] === undefined) continue;
       if (!node[container] || typeof node[container] !== "object" || Array.isArray(node[container])) {
@@ -124,12 +138,28 @@ function validateJsonSchema(value, schema) {
         add(path, "maximum", node.maximum, instance, "Number exceeds the maximum.");
       }
     }
+    if (typeof instance === "string") {
+      if (node.minLength !== undefined && instance.length < node.minLength) {
+        add(path, "minLength", node.minLength, instance.length, "String is too short.");
+      }
+      if (node.pattern !== undefined && !new RegExp(node.pattern).test(instance)) {
+        add(path, "pattern", node.pattern, instance, "String does not match the required pattern.");
+      }
+    }
     if (Array.isArray(instance)) {
       if (node.minItems !== undefined && instance.length < node.minItems) {
         add(path, "minItems", node.minItems, instance.length, "Array has too few items.");
       }
       if (node.maxItems !== undefined && instance.length > node.maxItems) {
         add(path, "maxItems", node.maxItems, instance.length, "Array has too many items.");
+      }
+      if (node.uniqueItems) {
+        const hasDuplicate = instance.some((item, index) => (
+          instance.slice(index + 1).some((other) => isDeepStrictEqual(item, other))
+        ));
+        if (hasDuplicate) {
+          add(path, "uniqueItems", true, false, "Array items must be unique.");
+        }
       }
       if (node.items !== undefined) {
         instance.forEach((item, index) => visit(item, node.items, pointer(path, index)));
